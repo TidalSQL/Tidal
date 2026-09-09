@@ -4,27 +4,30 @@
     using Microsoft.SqlServer.TransactSql.ScriptDom;
     using Parquet.Schema;
     using Parquet;
+    using Parquet.Data;
     using System;
     using System.Collections.Generic;
     using System.Linq;
     using System.Threading.Tasks;
-    using ParquetSharp;
 
     internal partial class ParqBaseStatementVisitor : TSqlFragmentVisitor
     {
         private string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
-        private ServiceProvider serviceProvider;
+        private IServiceProvider serviceProvider;
         private readonly TSql160Parser sqlParser = new TSql160Parser(true, SqlEngineType.All);
+        public QueryResult LastResult { get; private set; } = new();
 
-        public ParqBaseStatementVisitor(ServiceProvider provider)
+        public ParqBaseStatementVisitor(IServiceProvider provider)
         {
             this.serviceProvider = provider;
         }
 
-        public void StartVisitor(string statement)
+        public QueryResult StartVisitor(string statement)
         {
+            this.LastResult = new QueryResult();
             var tsqlFragment = (TSqlScript)this.sqlParser.Parse(new StringReader(statement), out IList<ParseError> parseErrors);
             tsqlFragment.Accept(this);
+            return this.LastResult;
         }
 
         public override void Visit(CreateTableStatement node)
@@ -41,10 +44,13 @@
             try
             {
                 this.CreateTable(node.SchemaObjectName.BaseIdentifier.Value, list.ToList());
+                this.LastResult.Message = $"Table '{node.SchemaObjectName.BaseIdentifier.Value}' created.";
             }
             catch (Exception ex)
             {
                 Console.WriteLine(ex.Message);
+                this.LastResult.Message = ex.Message;
+                this.LastResult.Success = false;
             }
             finally
             {
@@ -101,6 +107,8 @@
             {
                 Directory.CreateDirectory("users");
             }
+
+            this.LastResult.Message = $"Database '{node.DatabaseName.Value}' created.";
         }
 
         public override void Visit(UseStatement node)
@@ -121,44 +129,90 @@
             }
 
             Directory.SetCurrentDirectory(databaseDirectory);
+
+            this.LastResult.Message = $"Changed database context to '{node.DatabaseName.Value}'.";
         }
 
         public override void Visit(InsertStatement node)
         {
             Console.WriteLine("InsertStatement");
-            var insertDictionary = new Dictionary<ColumnReferenceExpression, ScalarExpression>();
-
 
             // Get column names
-            var columnName = new List<string>();
-            var columnValues = node.InsertSpecification.Columns;
-            if (columnValues != null)
+            var columnNames = new List<string>();
+            foreach (var column in node.InsertSpecification.Columns)
             {
-                foreach (var column in columnValues)
-                {
-                    columnName.Add(column.MultiPartIdentifier.Identifiers[0].Value);
-                }
+                columnNames.Add(column.MultiPartIdentifier.Identifiers[0].Value);
             }
 
-            // Get column values
-            var rowValuesList = new List<ScalarExpression>();
+            // Get row values
             var rowValues = ((ValuesInsertSource)node.InsertSpecification.InsertSource).RowValues[0].ColumnValues;
-            if (rowValues != null)
-            {
-                foreach (var row in rowValues)
-                {
-                    rowValuesList.Add(row);
-                }
-            }
+            var rowValuesList = new List<ScalarExpression>(rowValues);
 
             var tableReference = node.InsertSpecification.Target as NamedTableReference;
-
             if (tableReference != null)
             {
+                var tableName = tableReference.SchemaObject.BaseIdentifier.Value;
                 var currentDirectory = Directory.GetCurrentDirectory();
-
                 Directory.SetCurrentDirectory("tables");
-                this.ReadParquetFile($"{tableReference.SchemaObject.BaseIdentifier.Value}.parquet");
+                try
+                {
+                    this.InsertIntoParquetFile($"{tableName}.parquet", tableName, columnNames, rowValuesList);
+                    this.LastResult.Message = $"Row inserted into [{tableName}].";
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to insert into [{tableName}]. Error: {ex.Message}");
+                    this.LastResult.Message = $"Failed to insert into [{tableName}]. Error: {ex.Message}";
+                    this.LastResult.Success = false;
+                }
+                finally
+                {
+                    Directory.SetCurrentDirectory(currentDirectory);
+                }
+            }
+        }
+
+        public override void Visit(SelectStatement node)
+        {
+            Console.WriteLine("SelectStatement");
+
+            var querySpec = node.QueryExpression as QuerySpecification;
+            if (querySpec == null) return;
+
+            // Get table name from FROM clause
+            var tableRef = querySpec.FromClause.TableReferences[0] as NamedTableReference;
+            if (tableRef == null) return;
+            var tableName = tableRef.SchemaObject.BaseIdentifier.Value;
+
+            // Determine selected columns
+            var selectAll = false;
+            var selectedColumns = new List<string>();
+            foreach (var element in querySpec.SelectElements)
+            {
+                if (element is SelectStarExpression)
+                {
+                    selectAll = true;
+                    break;
+                }
+                else if (element is SelectScalarExpression scalar &&
+                         scalar.Expression is ColumnReferenceExpression colRef)
+                {
+                    selectedColumns.Add(colRef.MultiPartIdentifier.Identifiers.Last().Value);
+                }
+            }
+
+            var currentDirectory = Directory.GetCurrentDirectory();
+            Directory.SetCurrentDirectory("tables");
+            try
+            {
+                this.SelectFromParquetFile($"{tableName}.parquet", tableName, selectAll, selectedColumns);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to select from [{tableName}]. Error: {ex.Message}");
+            }
+            finally
+            {
                 Directory.SetCurrentDirectory(currentDirectory);
             }
         }
@@ -246,97 +300,259 @@
             }
         }
 
-        private List<Dictionary<string, object>> ReadParquetFile(string filePath)
+        private void InsertIntoParquetFile(string filePath, string tableName, List<string> columnNames, List<ScalarExpression> values)
         {
-            var rows = new List<Dictionary<string, object>>();
             var cache = this.serviceProvider.GetService<ITableColumnCache>();
-
-            using (var fileReader = new ParquetFileReader(filePath))
+            if (cache == null)
             {
-                if (fileReader.FileMetaData.NumRowGroups == 0)
+                throw new Exception("Table column cache is not available.");
+            }
+
+            var columnTypes = cache.Get(tableName);
+
+            // Initialize column data storage for all table columns
+            var columnData = new Dictionary<string, List<object>>();
+            foreach (var kvp in columnTypes)
+            {
+                columnData[kvp.Key] = new List<object>();
+            }
+
+            // Read existing rows from parquet file
+            if (File.Exists(filePath))
+            {
+                Task.Run(async () =>
                 {
-                    var schema = new ParquetSchema(
-                        new DataField<int>("Id"),
-                        new DataField<string>("Name"),
-                        new DataField<int>("Age"));
-
-                    /*
-                    using (var writer = new ParquetWriter(schema, filePath))
+                    using (Stream readStream = File.OpenRead(filePath))
                     {
-                        writer.Close();
-                    }
-                    */
-
-                    // Open a MemoryStream to hold the data (if working in memory)
-                    using (var memoryStream = new MemoryStream())
-                    {
-
-                        /*
-                       using ( var writer = new ParquetFileWriter(filePath, schema))
-                       {
-
-                       }
-
-
-                           using (var fileWriter = new ParquetFileWriter(memoryStream, columns))
-                           {
-                           using (var rowGroupWriter = fileWriter.AppendRowGroup())
-                           {
-                               foreach (var column in new[] { "Id", "Name", "Age" })
-                               {
-                                   var values = newData.Select(row => row[column]).ToArray();
-                                   using (var columnWriter = rowGroupWriter.NextColumn().LogicalWriter<object>())
-                                   {
-                                       columnWriter.WriteBatch(values);
-                                   }
-                               }
-                           }
-                       fileWriter.Close();
-                       }
-
-                       // If the file is empty, write the memory stream to a new file
-                       /*
-                       if (isFileEmpty)
-                       {
-                           File.WriteAllBytes(filePath, memoryStream.ToArray());
-                       }
-                       else
-                       {
-                           // Merge old and new data (overwrite or save separately)
-                           var oldData = ReadParquetFile(filePath);
-                           oldData.AddRange(newData);
-
-                           WriteParquetFile(filePath, oldData);
-                       }
-                       */
-                    }
-                }
-                else
-                {
-                    using (var rowGroupReader = fileReader.RowGroup(0)) // Read first row group
-                    {
-                        /*
-                        var schema = fileReader.Fields;
-                        foreach (var field in schema)
+                        using (var reader = await ParquetReader.CreateAsync(readStream))
                         {
-                            using (var columnReader = rowGroupReader.Column(field.Index))
+                            for (int g = 0; g < reader.RowGroupCount; g++)
                             {
-                                object[] values = columnReader.ReadAll<object>(); // Read column data
-                                for (int i = 0; i < values.Length; i++)
+                                using (var groupReader = reader.OpenRowGroupReader(g))
                                 {
-                                    if (rows.Count <= i)
-                                        rows.Add(new Dictionary<string, object>());
-
-                                    rows[i][field.Name] = values[i];
+                                    foreach (var field in reader.Schema.DataFields)
+                                    {
+                                        var dc = await groupReader.ReadColumnAsync(field);
+                                        if (columnData.ContainsKey(field.Name))
+                                        {
+                                            foreach (var val in dc.Data)
+                                            {
+                                                columnData[field.Name].Add(val);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                        */
                     }
+                }).Wait();
+            }
+
+            // Add new row values for specified columns
+            for (int i = 0; i < columnNames.Count; i++)
+            {
+                var colName = columnNames[i];
+                var colType = columnTypes[colName];
+                columnData[colName].Add(this.ConvertSqlValue(values[i], colType));
+            }
+
+            // Build schema from cached column types
+            var fields = new List<Parquet.Schema.Field>();
+            foreach (var kvp in columnTypes)
+            {
+                switch (kvp.Value)
+                {
+                    case "int":
+                        fields.Add(new DataField<int>(kvp.Key));
+                        break;
+                    case "string":
+                        fields.Add(new DataField<string>(kvp.Key));
+                        break;
+                    case "datetime":
+                        fields.Add(new DataField<DateTime>(kvp.Key));
+                        break;
+                    case "decimal":
+                        fields.Add(new DataField<decimal>(kvp.Key));
+                        break;
                 }
             }
 
-            return rows;
+            var schema = new ParquetSchema(fields);
+
+            // Write all data back to the parquet file
+            Task.Run(async () =>
+            {
+                using (Stream writeStream = File.Create(filePath))
+                {
+                    using (var writer = await ParquetWriter.CreateAsync(schema, writeStream))
+                    {
+                        writer.CompressionMethod = CompressionMethod.Gzip;
+                        writer.CompressionLevel = System.IO.Compression.CompressionLevel.Optimal;
+
+                        using (var groupWriter = writer.CreateRowGroup())
+                        {
+                            foreach (var field in schema.DataFields)
+                            {
+                                var colType = columnTypes[field.Name];
+                                var data = columnData[field.Name];
+
+                                switch (colType)
+                                {
+                                    case "int":
+                                        await groupWriter.WriteColumnAsync(
+                                            new DataColumn(field, data.Cast<int>().ToArray()));
+                                        break;
+                                    case "string":
+                                        await groupWriter.WriteColumnAsync(
+                                            new DataColumn(field, data.Cast<string>().ToArray()));
+                                        break;
+                                    case "datetime":
+                                        await groupWriter.WriteColumnAsync(
+                                            new DataColumn(field, data.Cast<DateTime>().ToArray()));
+                                        break;
+                                    case "decimal":
+                                        await groupWriter.WriteColumnAsync(
+                                            new DataColumn(field, data.Cast<decimal>().ToArray()));
+                                        break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }).Wait();
+
+            Console.WriteLine($"Row inserted into [{tableName}].");
+        }
+
+        private void SelectFromParquetFile(string filePath, string tableName, bool selectAll, List<string> selectedColumns)
+        {
+            if (!File.Exists(filePath))
+            {
+                throw new Exception($"Table [{tableName}] does not exist.");
+            }
+
+            // Read all column data from the parquet file
+            var columnData = new Dictionary<string, List<object>>();
+            var columnOrder = new List<string>();
+            int rowCount = 0;
+
+            Task.Run(async () =>
+            {
+                using (Stream readStream = File.OpenRead(filePath))
+                {
+                    using (var reader = await ParquetReader.CreateAsync(readStream))
+                    {
+                        foreach (var field in reader.Schema.DataFields)
+                        {
+                            columnData[field.Name] = new List<object>();
+                            columnOrder.Add(field.Name);
+                        }
+
+                        for (int g = 0; g < reader.RowGroupCount; g++)
+                        {
+                            using (var groupReader = reader.OpenRowGroupReader(g))
+                            {
+                                foreach (var field in reader.Schema.DataFields)
+                                {
+                                    var dc = await groupReader.ReadColumnAsync(field);
+                                    foreach (var val in dc.Data)
+                                    {
+                                        columnData[field.Name].Add(val);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (columnOrder.Count > 0 && columnData[columnOrder[0]].Count > 0)
+                        {
+                            rowCount = columnData[columnOrder[0]].Count;
+                        }
+                    }
+                }
+            }).Wait();
+
+            // Filter to selected columns
+            var displayColumns = selectAll ? columnOrder : selectedColumns;
+
+            // Calculate column widths for formatting
+            var colWidths = new Dictionary<string, int>();
+            foreach (var col in displayColumns)
+            {
+                int maxWidth = col.Length;
+                if (columnData.ContainsKey(col))
+                {
+                    foreach (var val in columnData[col])
+                    {
+                        int valLen = (val?.ToString() ?? "NULL").Length;
+                        if (valLen > maxWidth) maxWidth = valLen;
+                    }
+                }
+                colWidths[col] = maxWidth;
+            }
+
+            // Print header
+            var header = string.Join(" | ", displayColumns.Select(c => c.PadRight(colWidths[c])));
+            Console.WriteLine(header);
+            Console.WriteLine(new string('-', header.Length));
+
+            // Print rows
+            for (int i = 0; i < rowCount; i++)
+            {
+                var row = string.Join(" | ", displayColumns.Select(c =>
+                {
+                    var val = columnData.ContainsKey(c) && i < columnData[c].Count
+                        ? columnData[c][i]?.ToString() ?? "NULL"
+                        : "NULL";
+                    return val.PadRight(colWidths[c]);
+                }));
+                Console.WriteLine(row);
+            }
+
+            Console.WriteLine($"\n({rowCount} row(s) returned)");
+
+            // Populate query result
+            this.LastResult.Columns = displayColumns.ToList();
+            this.LastResult.RowCount = rowCount;
+            this.LastResult.Message = $"({rowCount} row(s) returned)";
+            for (int i = 0; i < rowCount; i++)
+            {
+                var row = new Dictionary<string, object?>();
+                foreach (var col in displayColumns)
+                {
+                    row[col] = columnData.ContainsKey(col) && i < columnData[col].Count
+                        ? columnData[col][i]
+                        : null;
+                }
+                this.LastResult.Rows.Add(row);
+            }
+        }
+
+        private object ConvertSqlValue(ScalarExpression expression, string targetType)
+        {
+            switch (targetType)
+            {
+                case "int":
+                    if (expression is IntegerLiteral intLiteral)
+                        return int.Parse(intLiteral.Value);
+                    break;
+                case "string":
+                    if (expression is StringLiteral strLiteral)
+                        return strLiteral.Value;
+                    break;
+                case "datetime":
+                    if (expression is StringLiteral dateLiteral)
+                        return DateTime.Parse(dateLiteral.Value);
+                    break;
+                case "decimal":
+                    if (expression is IntegerLiteral decIntLiteral)
+                        return decimal.Parse(decIntLiteral.Value);
+                    if (expression is NumericLiteral numLiteral)
+                        return decimal.Parse(numLiteral.Value);
+                    if (expression is MoneyLiteral moneyLiteral)
+                        return decimal.Parse(moneyLiteral.Value);
+                    break;
+            }
+            throw new ArgumentException($"Cannot convert value to {targetType}.");
         }
 
     }
