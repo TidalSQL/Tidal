@@ -10,7 +10,6 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.2" />
     <PackageReference Include="Microsoft.SqlServer.TransactSql.ScriptDom" Version="170.23.0" />
     <PackageReference Include="Parquet.Net" Version="5.1.1-pre.2" />
-    <PackageReference Include="ParquetSharp" Version="18.1.0-beta1" />
   </ItemGroup>
 
 </Project>

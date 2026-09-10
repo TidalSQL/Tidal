@@ -1,32 +1,40 @@
 ﻿namespace ParqBaseLib
 {
-    using Microsoft.Extensions.DependencyInjection;
+    using System;
 
     public class ParqBase
     {
-        private ParqBaseStatementVisitor parqBaseStatementVisitor;
-
-        public ParqBase(IServiceProvider serviceProvider)
-        {
-            this.parqBaseStatementVisitor = new ParqBaseStatementVisitor(serviceProvider);
-        }
+        private readonly SessionContext session = new();
+        private readonly object gate = new();
 
         public ParqBase()
         {
-            var serviceCollection = new ServiceCollection();
-            serviceCollection.AddSingleton<ITableColumnCache, TableColumnCache>();
-            var serviceProvider = serviceCollection.BuildServiceProvider();
-            this.parqBaseStatementVisitor = new ParqBaseStatementVisitor(serviceProvider);
         }
+
+        // Retained for dependency-injection resolution; ParqBase keeps its own session state.
+        public ParqBase(IServiceProvider serviceProvider)
+        {
+        }
+
+        /// <summary>
+        /// Absolute path of the database currently selected in this session, or null if none.
+        /// </summary>
+        public string? CurrentDatabasePath => this.session.CurrentDatabasePath;
 
         public void ExecuteStatement(string statement)
         {
-            this.parqBaseStatementVisitor.StartVisitor(statement);
+            this.ExecuteQuery(statement);
         }
 
         public QueryResult ExecuteQuery(string statement)
         {
-            return this.parqBaseStatementVisitor.StartVisitor(statement);
+            // A ParqBase instance represents a single logical session; serialize calls so a
+            // shared instance stays consistent. Concurrency comes from using separate instances.
+            lock (this.gate)
+            {
+                var visitor = new ParqBaseStatementVisitor(this.session);
+                return visitor.Run(statement);
+            }
         }
     }
 }
