@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# ParqBase persistent data (databases + server security catalog)
+ParqBaseLib/databases/
+ParqBaseLib/system/

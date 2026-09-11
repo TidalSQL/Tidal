@@ -15,6 +15,8 @@
     {
         private readonly TSql160Parser sqlParser = new TSql160Parser(true, SqlEngineType.All);
         private readonly SessionContext session;
+        private Dictionary<string, RowSet>? cteScope;
+        private readonly Dictionary<string, ScalarExpression> parsedExpressionCache = new(StringComparer.Ordinal);
 
         public QueryResult LastResult { get; private set; } = new();
 
@@ -40,6 +42,59 @@
             return this.LastResult;
         }
 
+        /// <summary>
+        /// Executes a multi-statement T-SQL script, running each statement in order and returning a
+        /// result per statement. GO batch separators are honored. Statements share this visitor's
+        /// session, so a CREATE DATABASE / USE / CREATE TABLE / INSERT sequence works as expected.
+        /// By default execution stops at the first failing statement (like sqlcmd without -b off).
+        /// </summary>
+        public List<QueryResult> RunScript(string script, bool continueOnError = false)
+        {
+            var results = new List<QueryResult>();
+
+            var fragment = this.sqlParser.Parse(new StringReader(script), out IList<ParseError> parseErrors);
+            if (parseErrors != null && parseErrors.Count > 0)
+            {
+                results.Add(new QueryResult
+                {
+                    Success = false,
+                    Message = "Parse error: " + string.Join("; ",
+                        parseErrors.Select(e => $"Line {e.Line}, Col {e.Column}: {e.Message}")),
+                });
+                return results;
+            }
+
+            var statements = new List<TSqlStatement>();
+            if (fragment is TSqlScript tsqlScript)
+            {
+                foreach (var batch in tsqlScript.Batches)
+                {
+                    statements.AddRange(batch.Statements);
+                }
+            }
+
+            foreach (var statement in statements)
+            {
+                this.LastResult = new QueryResult();
+                try
+                {
+                    statement.Accept(this);
+                }
+                catch (Exception ex)
+                {
+                    this.Fail(ex);
+                }
+
+                results.Add(this.LastResult);
+                if (!this.LastResult.Success && !continueOnError)
+                {
+                    break;
+                }
+            }
+
+            return results;
+        }
+
         public override void Visit(CreateDatabaseStatement node)
         {
             try
@@ -56,6 +111,7 @@
                 }
 
                 this.session.CurrentDatabasePath = databaseDirectory;
+                this.Catalog().SeedDatabase();
                 this.LastResult.Message = $"Database '{node.DatabaseName.Value}' created.";
             }
             catch (Exception ex)
@@ -87,12 +143,21 @@
         {
             try
             {
+                var (schema, table) = this.ResolveTableName(node.SchemaObjectName);
+                if (!this.Catalog().SchemaExists(schema))
+                {
+                    throw new Exception($"Schema '{schema}' does not exist. Create it with CREATE SCHEMA first.");
+                }
+
+                this.Authorize(Security.SecurityAction.CreateObject, schema, table);
+
                 var tablesDir = this.TablesDirectory();
                 Directory.CreateDirectory(tablesDir);
+                var filePath = this.ResolveTableFilePath(schema, table);
 
                 var columns = node.Definition.ColumnDefinitions.ToList();
-                this.CreateTable(node.SchemaObjectName.BaseIdentifier.Value, columns, tablesDir);
-                this.LastResult.Message = $"Table '{node.SchemaObjectName.BaseIdentifier.Value}' created.";
+                this.CreateTable(table, filePath, columns);
+                this.LastResult.Message = $"Table '{table}' created.";
             }
             catch (Exception ex)
             {
@@ -104,31 +169,56 @@
         {
             try
             {
-                var tablesDir = this.TablesDirectory();
+                using var _ = this.EnterCteScope(node.WithCtesAndXmlNamespaces);
+                var spec = node.InsertSpecification;
 
-                var columnNames = node.InsertSpecification.Columns
-                    .Select(c => c.MultiPartIdentifier.Identifiers[0].Value)
-                    .ToList();
-
-                if (node.InsertSpecification.InsertSource is not ValuesInsertSource valuesSource)
-                {
-                    throw new NotSupportedException("Only INSERT ... VALUES is supported.");
-                }
-
-                var rows = valuesSource.RowValues
-                    .Select(rv => rv.ColumnValues.ToList())
-                    .ToList();
-
-                if (node.InsertSpecification.Target is not NamedTableReference tableReference)
+                if (spec.Target is not NamedTableReference tableReference)
                 {
                     throw new NotSupportedException("INSERT target must be a table.");
                 }
 
-                var tableName = tableReference.SchemaObject.BaseIdentifier.Value;
-                var filePath = Path.Combine(tablesDir, $"{tableName}.parquet");
+                var (schema, table) = this.ResolveTableName(tableReference.SchemaObject);
+                this.Authorize(Security.SecurityAction.Insert, schema, table);
+                var filePath = this.ResolveTableFilePath(schema, table);
+                if (!File.Exists(filePath))
+                {
+                    throw new Exception($"Table [{table}] does not exist.");
+                }
 
-                this.InsertRows(filePath, tableName, columnNames, rows);
-                this.LastResult.Message = $"{rows.Count} row(s) inserted into [{tableName}].";
+                var tableData = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
+                var meta = LoadMeta(filePath);
+
+                var explicitColumns = spec.Columns
+                    .Select(c => c.MultiPartIdentifier.Identifiers[0].Value)
+                    .ToList();
+                var insertColumns = explicitColumns.Count > 0
+                    ? explicitColumns
+                    : this.InsertableColumns(tableData, meta);
+
+                foreach (var col in insertColumns)
+                {
+                    if (!tableData.Types.ContainsKey(col))
+                    {
+                        throw new ArgumentException($"Column [{col}] does not exist in table [{table}].");
+                    }
+                }
+
+                List<Dictionary<string, object?>> providedRows;
+                if (spec.InsertSource is ValuesInsertSource valuesSource)
+                {
+                    providedRows = this.EvaluateValuesRows(valuesSource, insertColumns, tableData.Types);
+                }
+                else if (spec.InsertSource is SelectInsertSource selectSource)
+                {
+                    providedRows = this.EvaluateSelectRows(selectSource, insertColumns);
+                }
+                else
+                {
+                    throw new NotSupportedException("Only INSERT ... VALUES and INSERT ... SELECT are supported.");
+                }
+
+                var count = this.AppendRows(filePath, tableData, meta, providedRows);
+                this.LastResult.Message = $"{count} row(s) inserted into [{table}].";
             }
             catch (Exception ex)
             {
@@ -140,12 +230,8 @@
         {
             try
             {
-                if (node.QueryExpression is not QuerySpecification querySpec)
-                {
-                    throw new NotSupportedException("Only SELECT queries are supported.");
-                }
-
-                var rowSet = this.EvaluateQuery(querySpec, null);
+                using var _ = this.EnterCteScope(node.WithCtesAndXmlNamespaces);
+                var rowSet = this.EvaluateQueryExpression(node.QueryExpression, null);
                 var columns = BuildDisplayNames(rowSet.Schema);
 
                 var rows = new List<Dictionary<string, object?>>();
@@ -172,25 +258,108 @@
         }
 
         /// <summary>
+        /// Evaluates any query expression (a plain SELECT, a parenthesized query, or a
+        /// UNION/EXCEPT/INTERSECT combination) into a <see cref="RowSet"/>.
+        /// </summary>
+        private RowSet EvaluateQueryExpression(QueryExpression expression, Env? outer, long? limit = null)
+        {
+            switch (expression)
+            {
+                case QuerySpecification querySpec:
+                    return this.EvaluateQuery(querySpec, outer, limit);
+
+                case QueryParenthesisExpression paren:
+                    return this.EvaluateQueryExpression(paren.QueryExpression, outer, limit);
+
+                case BinaryQueryExpression binary:
+                {
+                    var left = this.EvaluateQueryExpression(binary.FirstQueryExpression, outer);
+                    var right = this.EvaluateQueryExpression(binary.SecondQueryExpression, outer);
+                    var rows = CombineSetOperation(left.Rows, right.Rows, binary.BinaryQueryExpressionType, binary.All);
+                    return new RowSet(left.Schema, rows);
+                }
+
+                default:
+                    throw new NotSupportedException($"Unsupported query expression: {expression.GetType().Name}");
+            }
+        }
+
+        private static List<object?[]> CombineSetOperation(
+            List<object?[]> left,
+            List<object?[]> right,
+            BinaryQueryExpressionType type,
+            bool all)
+        {
+            switch (type)
+            {
+                case BinaryQueryExpressionType.Union:
+                {
+                    var rows = new List<object?[]>(left);
+                    rows.AddRange(right);
+                    return all ? rows : DistinctRows(rows);
+                }
+
+                case BinaryQueryExpressionType.Except:
+                {
+                    var rightKeys = new HashSet<string>(right.Select(RowKey));
+                    var rows = left.Where(r => !rightKeys.Contains(RowKey(r))).ToList();
+                    return all ? rows : DistinctRows(rows);
+                }
+
+                case BinaryQueryExpressionType.Intersect:
+                {
+                    var rightKeys = new HashSet<string>(right.Select(RowKey));
+                    var rows = left.Where(r => rightKeys.Contains(RowKey(r))).ToList();
+                    return all ? rows : DistinctRows(rows);
+                }
+
+                default:
+                    throw new NotSupportedException($"Unsupported set operation: {type}");
+            }
+        }
+
+        private static string RowKey(object?[] row) =>
+            string.Join("\u0001", row.Select(v => v?.ToString() ?? "\0NULL"));
+
+        /// <summary>
         /// Evaluates a query specification (top-level SELECT, derived table, or subquery) into a
         /// projected <see cref="RowSet"/>. <paramref name="outer"/> supplies correlated columns.
+        /// <paramref name="limit"/> is an optional row cap the caller can push down.
         /// </summary>
-        private RowSet EvaluateQuery(QuerySpecification querySpec, Env? outer)
+        private RowSet EvaluateQuery(QuerySpecification querySpec, Env? outer, long? limit = null)
         {
-            if (querySpec.GroupByClause != null || querySpec.HavingClause != null)
-            {
-                throw new NotSupportedException("GROUP BY / HAVING are not supported.");
-            }
+            var hasAggregate = querySpec.GroupByClause != null || SelectHasAggregate(querySpec);
 
+            // FROM-less SELECT (e.g. a scalar subquery "(SELECT NULL)" or "SELECT 1"): evaluate the
+            // projection against a single empty row.
             if (querySpec.FromClause == null || querySpec.FromClause.TableReferences.Count == 0)
             {
-                throw new NotSupportedException("SELECT requires a FROM clause.");
+                var emptySchema = new List<ColumnRef>();
+                var singleRow = new List<object?[]> { Array.Empty<object?>() };
+                return hasAggregate
+                    ? this.EvaluateAggregate(querySpec, emptySchema, singleRow, outer)
+                    : this.ProjectRows(querySpec, emptySchema, singleRow, outer);
             }
 
-            var source = this.EvaluateTableReference(querySpec.FromClause.TableReferences[0], outer);
+            // TOP without WHERE/ORDER/GROUP/DISTINCT/aggregate can be pushed into the source so a
+            // large CROSS JOIN generator (e.g. sys.all_objects) does not fully materialize.
+            long? pushLimit = limit;
+            var topCount = this.GetTopCount(querySpec.TopRowFilter);
+            if (pushLimit == null &&
+                querySpec.WhereClause == null &&
+                querySpec.OrderByClause == null &&
+                querySpec.GroupByClause == null &&
+                querySpec.UniqueRowFilter != UniqueRowFilter.Distinct &&
+                !hasAggregate &&
+                topCount.HasValue)
+            {
+                pushLimit = topCount.Value;
+            }
+
+            var source = this.EvaluateTableReference(querySpec.FromClause.TableReferences[0], outer, pushLimit);
             for (var i = 1; i < querySpec.FromClause.TableReferences.Count; i++)
             {
-                source = this.CrossJoin(source, this.EvaluateTableReference(querySpec.FromClause.TableReferences[i], outer));
+                source = this.LimitedCrossJoin(source, this.EvaluateTableReference(querySpec.FromClause.TableReferences[i], outer, pushLimit), pushLimit);
             }
 
             // WHERE
@@ -204,18 +373,30 @@
                 }
             }
 
-            // ORDER BY (resolved against the source rows, before projection)
+            if (hasAggregate)
+            {
+                return this.EvaluateAggregate(querySpec, source.Schema, filtered, outer);
+            }
+
+            // ORDER BY (resolved against the source rows, before projection). Order keys are
+            // precomputed once per row so the comparer does not re-evaluate expressions.
             if (querySpec.OrderByClause != null)
             {
                 var elems = querySpec.OrderByClause.OrderByElements;
-                filtered.Sort((a, b) =>
-                {
-                    foreach (var oe in elems)
+                var keyed = filtered
+                    .Select(row =>
                     {
-                        var av = this.GetScalarValue(oe.Expression, new Env(source.Schema, a, outer));
-                        var bv = this.GetScalarValue(oe.Expression, new Env(source.Schema, b, outer));
-                        var cmp = CompareForOrder(av, bv);
-                        if (oe.SortOrder == SortOrder.Descending)
+                        var env = new Env(source.Schema, row, outer);
+                        return (Row: row, Keys: elems.Select(oe => this.GetScalarValue(oe.Expression, env)).ToArray());
+                    })
+                    .ToList();
+
+                keyed.Sort((a, b) =>
+                {
+                    for (var k = 0; k < elems.Count; k++)
+                    {
+                        var cmp = CompareForOrder(a.Keys[k], b.Keys[k]);
+                        if (elems[k].SortOrder == SortOrder.Descending)
                         {
                             cmp = -cmp;
                         }
@@ -228,19 +409,26 @@
 
                     return 0;
                 });
+
+                filtered = keyed.Select(x => x.Row).ToList();
             }
 
-            // Projection
+            return this.ProjectRows(querySpec, source.Schema, filtered, outer);
+        }
+
+        private RowSet ProjectRows(QuerySpecification querySpec, List<ColumnRef> sourceSchema, List<object?[]> filtered, Env? outer)
+        {
             var projSchema = new List<ColumnRef>();
-            var projectors = new List<Func<object?[], object?>>();
+            var projectors = new List<Func<object?[], int, object?>>();
+
             foreach (var element in querySpec.SelectElements)
             {
                 if (element is SelectStarExpression star)
                 {
                     var starQualifier = star.Qualifier?.Identifiers.LastOrDefault()?.Value;
-                    for (var i = 0; i < source.Schema.Count; i++)
+                    for (var i = 0; i < sourceSchema.Count; i++)
                     {
-                        var column = source.Schema[i];
+                        var column = sourceSchema[i];
                         if (starQualifier != null &&
                             !string.Equals(column.Qualifier, starQualifier, StringComparison.OrdinalIgnoreCase))
                         {
@@ -249,12 +437,21 @@
 
                         var index = i;
                         projSchema.Add(new ColumnRef(column.Qualifier, column.Name));
-                        projectors.Add(values => values[index]);
+                        projectors.Add((values, _) => values[index]);
                     }
                 }
                 else if (element is SelectScalarExpression scalar)
                 {
                     var alias = scalar.ColumnName?.Value;
+
+                    if (scalar.Expression is FunctionCall { OverClause: { } } window)
+                    {
+                        var numbers = this.ComputeWindowValues(window, sourceSchema, filtered, outer);
+                        projSchema.Add(new ColumnRef(string.Empty, alias ?? "column"));
+                        projectors.Add((_, rowIndex) => numbers[rowIndex]);
+                        continue;
+                    }
+
                     string qualifier = string.Empty;
                     string name;
                     if (scalar.Expression is ColumnReferenceExpression colRef)
@@ -270,7 +467,7 @@
 
                     var expr = scalar.Expression;
                     projSchema.Add(new ColumnRef(qualifier, name));
-                    projectors.Add(values => this.GetScalarValue(expr, new Env(source.Schema, values, outer)));
+                    projectors.Add((values, _) => this.GetScalarValue(expr, new Env(sourceSchema, values, outer)));
                 }
                 else
                 {
@@ -279,12 +476,12 @@
             }
 
             var projRows = new List<object?[]>();
-            foreach (var row in filtered)
+            for (var r = 0; r < filtered.Count; r++)
             {
                 var projected = new object?[projectors.Count];
                 for (var i = 0; i < projectors.Count; i++)
                 {
-                    projected[i] = projectors[i](row);
+                    projected[i] = projectors[i](filtered[r], r);
                 }
 
                 projRows.Add(projected);
@@ -295,25 +492,59 @@
                 projRows = DistinctRows(projRows);
             }
 
-            if (querySpec.TopRowFilter?.Expression is IntegerLiteral topLiteral)
+            var topN = this.GetTopCount(querySpec.TopRowFilter);
+            if (topN.HasValue && projRows.Count > topN.Value)
             {
-                var n = int.Parse(topLiteral.Value, CultureInfo.InvariantCulture);
-                if (projRows.Count > n)
-                {
-                    projRows = projRows.Take(n).ToList();
-                }
+                projRows = projRows.Take(topN.Value).ToList();
             }
 
             return new RowSet(projSchema, projRows);
         }
 
-        private RowSet EvaluateTableReference(TableReference tableReference, Env? outer)
+        /// <summary>Evaluates a TOP (n) clause to a constant row count, unwrapping parentheses. Ignores TOP PERCENT.</summary>
+        private int? GetTopCount(TopRowFilter? top)
+        {
+            if (top == null || top.Percent)
+            {
+                return null;
+            }
+
+            var expr = top.Expression;
+            while (expr is ParenthesisExpression paren)
+            {
+                expr = paren.Expression;
+            }
+
+            if (expr is IntegerLiteral literal)
+            {
+                return int.Parse(literal.Value, CultureInfo.InvariantCulture);
+            }
+
+            var value = this.GetScalarValue(top.Expression, EmptyRowEnv);
+            return value == null ? null : ToInt(value);
+        }
+
+        private RowSet EvaluateTableReference(TableReference tableReference, Env? outer, long? limit = null)
         {
             switch (tableReference)
             {
                 case NamedTableReference named:
                 {
                     var qualifier = named.Alias?.Value ?? named.SchemaObject.BaseIdentifier.Value;
+
+                    // A common table expression (WITH ...) shadows physical tables when unqualified.
+                    if (named.SchemaObject.SchemaIdentifier == null &&
+                        this.cteScope != null &&
+                        this.cteScope.TryGetValue(named.SchemaObject.BaseIdentifier.Value, out var cte))
+                    {
+                        var cteSchema = cte.Schema.Select(c => new ColumnRef(qualifier, c.Name)).ToList();
+                        return new RowSet(cteSchema, cte.Rows);
+                    }
+
+                    if (IsSystemCatalog(named, "all_objects") || IsSystemCatalog(named, "objects_generator"))
+                    {
+                        return BuildAllObjectsRowSet(qualifier, limit);
+                    }
 
                     if (IsSystemCatalog(named, "databases"))
                     {
@@ -330,8 +561,16 @@
                         return this.BuildTablesRowSet(qualifier);
                     }
 
-                    var tableName = named.SchemaObject.BaseIdentifier.Value;
-                    var filePath = Path.Combine(this.TablesDirectory(), $"{tableName}.parquet");
+                    var securityView = this.TryBuildSecurityCatalog(named, qualifier);
+                    if (securityView != null)
+                    {
+                        return securityView;
+                    }
+
+                    var (schemaName, tableName) = this.ResolveTableName(named.SchemaObject);
+                    this.Authorize(Security.SecurityAction.Select, schemaName, tableName);
+
+                    var filePath = this.ResolveTableFilePath(schemaName, tableName);
                     if (!File.Exists(filePath))
                     {
                         throw new Exception($"Table [{tableName}] does not exist.");
@@ -350,17 +589,34 @@
 
                 case QueryDerivedTable derived:
                 {
-                    if (derived.QueryExpression is not QuerySpecification innerSpec)
-                    {
-                        throw new NotSupportedException("Only simple subqueries are supported as derived tables.");
-                    }
-
                     var alias = derived.Alias?.Value
                         ?? throw new NotSupportedException("A derived table (subquery in FROM) requires an alias.");
 
-                    var inner = this.EvaluateQuery(innerSpec, outer);
+                    var inner = this.EvaluateQueryExpression(derived.QueryExpression, outer);
                     var schema = inner.Schema.Select(c => new ColumnRef(alias, c.Name)).ToList();
                     return new RowSet(schema, inner.Rows);
+                }
+
+                case InlineDerivedTable inlineTable:
+                {
+                    var alias = inlineTable.Alias?.Value
+                        ?? throw new NotSupportedException("An inline table (VALUES in FROM) requires an alias.");
+
+                    var columnCount = inlineTable.RowValues.FirstOrDefault()?.ColumnValues.Count ?? 0;
+                    var names = inlineTable.Columns.Count > 0
+                        ? inlineTable.Columns.Select(c => c.Value).ToList()
+                        : Enumerable.Range(1, columnCount).Select(i => "column" + i).ToList();
+                    var schema = names.Select(n => new ColumnRef(alias, n)).ToList();
+
+                    var rows = new List<object?[]>();
+                    foreach (var rowValue in inlineTable.RowValues)
+                    {
+                        rows.Add(rowValue.ColumnValues
+                            .Select(v => v is NullLiteral ? null : this.GetScalarValue(v, outer ?? EmptyRowEnv))
+                            .ToArray());
+                    }
+
+                    return new RowSet(schema, rows);
                 }
 
                 case QualifiedJoin qualifiedJoin:
@@ -372,18 +628,18 @@
 
                 case UnqualifiedJoin unqualifiedJoin:
                 {
-                    var left = this.EvaluateTableReference(unqualifiedJoin.FirstTableReference, outer);
-                    var right = this.EvaluateTableReference(unqualifiedJoin.SecondTableReference, outer);
                     if (unqualifiedJoin.UnqualifiedJoinType == UnqualifiedJoinType.CrossJoin)
                     {
-                        return this.CrossJoin(left, right);
+                        var left = this.EvaluateTableReference(unqualifiedJoin.FirstTableReference, outer, limit);
+                        var right = this.EvaluateTableReference(unqualifiedJoin.SecondTableReference, outer, limit);
+                        return this.LimitedCrossJoin(left, right, limit);
                     }
 
                     throw new NotSupportedException($"Unsupported join: {unqualifiedJoin.UnqualifiedJoinType}");
                 }
 
                 case JoinParenthesisTableReference parenthesis:
-                    return this.EvaluateTableReference(parenthesis.Join, outer);
+                    return this.EvaluateTableReference(parenthesis.Join, outer, limit);
 
                 default:
                     throw new NotSupportedException($"Unsupported table reference: {tableReference.GetType().Name}");
@@ -395,6 +651,14 @@
             var schema = left.Schema.Concat(right.Schema).ToList();
             var leftWidth = left.Schema.Count;
             var rightWidth = right.Schema.Count;
+
+            // Fast path: INNER equi-join evaluated with a hash lookup instead of a nested loop.
+            if (joinType == QualifiedJoinType.Inner && on != null &&
+                this.TryHashJoin(left, right, on, outer, out var hashed))
+            {
+                return new RowSet(schema, hashed);
+            }
+
             var rows = new List<object?[]>();
             var rightMatched = new bool[right.Rows.Count];
 
@@ -432,8 +696,241 @@
             return new RowSet(schema, rows);
         }
 
+        private RowSet LimitedCrossJoin(RowSet left, RowSet right, long? limit)
+        {
+            var schema = left.Schema.Concat(right.Schema).ToList();
+            var rows = new List<object?[]>();
+            foreach (var leftRow in left.Rows)
+            {
+                foreach (var rightRow in right.Rows)
+                {
+                    rows.Add(Concat(leftRow, rightRow));
+                    if (limit.HasValue && rows.Count >= limit.Value)
+                    {
+                        return new RowSet(schema, rows);
+                    }
+                }
+            }
+
+            return new RowSet(schema, rows);
+        }
+
+        /// <summary>
+        /// Attempts an inner equi-join via hashing. Succeeds only when every top-level AND term of
+        /// the ON condition is an equality whose two sides reference exactly one input each (a pure
+        /// left key vs a pure right key). Returns false to fall back to the generic nested loop.
+        /// </summary>
+        private bool TryHashJoin(RowSet left, RowSet right, BooleanExpression on, Env? outer, out List<object?[]> rows)
+        {
+            rows = new List<object?[]>();
+
+            var leftQualifiers = left.Schema.Select(c => c.Qualifier).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var rightQualifiers = right.Schema.Select(c => c.Qualifier).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var leftKeyExprs = new List<ScalarExpression>();
+            var rightKeyExprs = new List<ScalarExpression>();
+
+            foreach (var term in SplitConjunction(on))
+            {
+                if (term is not BooleanComparisonExpression { ComparisonType: BooleanComparisonType.Equals } cmp)
+                {
+                    return false;
+                }
+
+                var firstSide = ClassifySide(cmp.FirstExpression, leftQualifiers, rightQualifiers);
+                var secondSide = ClassifySide(cmp.SecondExpression, leftQualifiers, rightQualifiers);
+
+                if (firstSide == Side.Left && secondSide == Side.Right)
+                {
+                    leftKeyExprs.Add(cmp.FirstExpression);
+                    rightKeyExprs.Add(cmp.SecondExpression);
+                }
+                else if (firstSide == Side.Right && secondSide == Side.Left)
+                {
+                    leftKeyExprs.Add(cmp.SecondExpression);
+                    rightKeyExprs.Add(cmp.FirstExpression);
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            if (leftKeyExprs.Count == 0)
+            {
+                return false;
+            }
+
+            var lookup = new Dictionary<string, List<object?[]>>();
+            foreach (var rightRow in right.Rows)
+            {
+                var env = new Env(right.Schema, rightRow, outer);
+                var key = string.Join("\u0001", rightKeyExprs.Select(e => Stringify(this.GetScalarValue(e, env))));
+                if (!lookup.TryGetValue(key, out var bucket))
+                {
+                    bucket = new List<object?[]>();
+                    lookup[key] = bucket;
+                }
+
+                bucket.Add(rightRow);
+            }
+
+            foreach (var leftRow in left.Rows)
+            {
+                var env = new Env(left.Schema, leftRow, outer);
+                var key = string.Join("\u0001", leftKeyExprs.Select(e => Stringify(this.GetScalarValue(e, env))));
+                if (lookup.TryGetValue(key, out var bucket))
+                {
+                    foreach (var rightRow in bucket)
+                    {
+                        rows.Add(Concat(leftRow, rightRow));
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        private enum Side
+        {
+            Left,
+            Right,
+            Both,
+            Unknown,
+        }
+
+        private static IEnumerable<BooleanExpression> SplitConjunction(BooleanExpression expr)
+        {
+            if (expr is BooleanBinaryExpression { BinaryExpressionType: BooleanBinaryExpressionType.And } and)
+            {
+                foreach (var e in SplitConjunction(and.FirstExpression))
+                {
+                    yield return e;
+                }
+
+                foreach (var e in SplitConjunction(and.SecondExpression))
+                {
+                    yield return e;
+                }
+            }
+            else
+            {
+                yield return expr;
+            }
+        }
+
+        /// <summary>Determines whether an expression references only the left input, only the right, both, or is not analyzable.</summary>
+        private static Side ClassifySide(ScalarExpression expr, HashSet<string> leftQualifiers, HashSet<string> rightQualifiers)
+        {
+            var quals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!TryCollectQualifiers(expr, quals))
+            {
+                return Side.Unknown;
+            }
+
+            var referencesLeft = quals.Any(leftQualifiers.Contains);
+            var referencesRight = quals.Any(rightQualifiers.Contains);
+
+            // A constant (no column references) can be evaluated on either side; treat as left.
+            if (!referencesLeft && !referencesRight)
+            {
+                return Side.Left;
+            }
+
+            if (referencesLeft && referencesRight)
+            {
+                return Side.Both;
+            }
+
+            return referencesLeft ? Side.Left : Side.Right;
+        }
+
+        /// <summary>Collects column qualifiers referenced by an expression. Returns false if the expression contains an unqualified column or a node type we can't safely analyze.</summary>
+        private static bool TryCollectQualifiers(ScalarExpression? expr, HashSet<string> qualifiers)
+        {
+            switch (expr)
+            {
+                case null:
+                case IntegerLiteral:
+                case NumericLiteral:
+                case MoneyLiteral:
+                case StringLiteral:
+                case NullLiteral:
+                    return true;
+
+                case ColumnReferenceExpression col:
+                {
+                    var ids = col.MultiPartIdentifier.Identifiers;
+                    if (ids.Count < 2)
+                    {
+                        return false;
+                    }
+
+                    qualifiers.Add(ids[ids.Count - 2].Value);
+                    return true;
+                }
+
+                case ParenthesisExpression paren:
+                    return TryCollectQualifiers(paren.Expression, qualifiers);
+
+                case UnaryExpression unary:
+                    return TryCollectQualifiers(unary.Expression, qualifiers);
+
+                case BinaryExpression binary:
+                    return TryCollectQualifiers(binary.FirstExpression, qualifiers) &&
+                           TryCollectQualifiers(binary.SecondExpression, qualifiers);
+
+                case CastCall cast:
+                    return TryCollectQualifiers(cast.Parameter, qualifiers);
+
+                case ConvertCall convert:
+                    return TryCollectQualifiers(convert.Parameter, qualifiers);
+
+                case FunctionCall fn:
+                    return fn.Parameters.All(p => TryCollectQualifiers(p, qualifiers));
+
+                case LeftFunctionCall left:
+                    return left.Parameters.All(p => TryCollectQualifiers(p, qualifiers));
+
+                case RightFunctionCall right:
+                    return right.Parameters.All(p => TryCollectQualifiers(p, qualifiers));
+
+                default:
+                    return false;
+            }
+        }
+
         private RowSet CrossJoin(RowSet left, RowSet right)
             => this.JoinRowSets(left, right, null, QualifiedJoinType.Inner, null);
+
+        /// <summary>
+        /// Synthetic row source approximating <c>sys.all_objects</c>: a wide-enough sequence of
+        /// rows used by scripts that generate data via ROW_NUMBER() over a cross join.
+        /// </summary>
+        private static RowSet BuildAllObjectsRowSet(string qualifier, long? limit)
+        {
+            const int baseCount = 2000;
+            var count = baseCount;
+            if (limit.HasValue && limit.Value < count)
+            {
+                count = (int)Math.Max(1, limit.Value);
+            }
+
+            var schema = new List<ColumnRef>
+            {
+                new(qualifier, "object_id"),
+                new(qualifier, "name"),
+                new(qualifier, "type"),
+            };
+
+            var rows = new List<object?[]>(count);
+            for (var i = 1; i <= count; i++)
+            {
+                rows.Add(new object?[] { i, "obj_" + i, "U " });
+            }
+
+            return new RowSet(schema, rows);
+        }
 
         private RowSet BuildDatabasesRowSet(string qualifier)
         {
@@ -528,12 +1025,7 @@
 
                 case ExistsPredicate exists:
                 {
-                    if (exists.Subquery.QueryExpression is not QuerySpecification subSpec)
-                    {
-                        throw new NotSupportedException("Only simple subqueries are supported in EXISTS.");
-                    }
-
-                    return this.EvaluateQuery(subSpec, env).Rows.Count > 0;
+                    return this.EvaluateQueryExpression(exists.Subquery.QueryExpression, env).Rows.Count > 0;
                 }
 
                 default:
@@ -543,12 +1035,7 @@
 
         private List<object?> EvaluateSubqueryColumn(ScalarSubquery subquery, Env outer)
         {
-            if (subquery.QueryExpression is not QuerySpecification subSpec)
-            {
-                throw new NotSupportedException("Only simple subqueries are supported.");
-            }
-
-            var rowSet = this.EvaluateQuery(subSpec, outer);
+            var rowSet = this.EvaluateQueryExpression(subquery.QueryExpression, outer);
             if (rowSet.Schema.Count != 1)
             {
                 throw new NotSupportedException("A subquery used here must return exactly one column.");
@@ -629,6 +1116,38 @@
 
                     return values[0];
                 }
+
+                case BinaryExpression binary:
+                    return this.EvalBinary(binary, env);
+
+                case FunctionCall functionCall:
+                    return this.EvalFunction(functionCall, env);
+
+                case LeftFunctionCall leftCall:
+                {
+                    var s = Stringify(this.GetScalarValue(leftCall.Parameters[0], env));
+                    var n = ToInt(this.GetScalarValue(leftCall.Parameters[1], env));
+                    return n <= 0 ? string.Empty : (n >= s.Length ? s : s.Substring(0, n));
+                }
+
+                case RightFunctionCall rightCall:
+                {
+                    var s = Stringify(this.GetScalarValue(rightCall.Parameters[0], env));
+                    var n = ToInt(this.GetScalarValue(rightCall.Parameters[1], env));
+                    return n <= 0 ? string.Empty : (n >= s.Length ? s : s.Substring(s.Length - n));
+                }
+
+                case CastCall cast:
+                    return ConvertToType(this.GetScalarValue(cast.Parameter, env), cast.DataType);
+
+                case ConvertCall convert:
+                    return ConvertToType(this.GetScalarValue(convert.Parameter, env), convert.DataType);
+
+                case SearchedCaseExpression searchedCase:
+                    return this.EvalSearchedCase(searchedCase, env);
+
+                case SimpleCaseExpression simpleCase:
+                    return this.EvalSimpleCase(simpleCase, env);
 
                 default:
                     throw new NotSupportedException($"Unsupported expression: {expression.GetType().Name}");
@@ -762,7 +1281,7 @@
             return result;
         }
 
-        private void CreateTable(string tableName, List<ColumnDefinition> columns, string tablesDir)
+        private void CreateTable(string tableName, string filePath, List<ColumnDefinition> columns)
         {
             if (string.IsNullOrEmpty(tableName))
             {
@@ -776,25 +1295,60 @@
 
             var types = new Dictionary<string, string>();
             var order = new List<string>();
+            var meta = new TableMeta();
 
             foreach (var column in columns)
             {
-                var sqlType = column.DataType.Name.BaseIdentifier.Value.ToUpperInvariant();
-                var mapped = sqlType switch
-                {
-                    "INT" or "INTEGER" or "BIGINT" or "SMALLINT" or "TINYINT" => "int",
-                    "VARCHAR" or "NVARCHAR" or "CHAR" or "NCHAR" or "TEXT" or "NTEXT" => "string",
-                    "DATE" or "DATETIME" or "DATETIME2" or "SMALLDATETIME" => "datetime",
-                    "MONEY" or "SMALLMONEY" or "DECIMAL" or "NUMERIC" or "FLOAT" or "REAL" => "decimal",
-                    _ => throw new ArgumentException($"Unsupported data type: {column.DataType.Name.BaseIdentifier.Value}")
-                };
-
                 var name = column.ColumnIdentifier.Value;
-                types[name] = mapped;
+                var columnMeta = new ColumnMeta { Name = name, Nullable = true };
+
+                if (column.ComputedColumnExpression != null)
+                {
+                    // Computed column: no declared type. Persist the expression and infer a
+                    // physical type (from a CAST/CONVERT target when present, else decimal).
+                    columnMeta.ComputedSql = GenerateSql(column.ComputedColumnExpression);
+                    columnMeta.Type = InferComputedType(column.ComputedColumnExpression);
+                }
+                else
+                {
+                    if (column.DataType?.Name?.BaseIdentifier?.Value is not string sqlType)
+                    {
+                        throw new ArgumentException($"Column '{name}' has no data type.");
+                    }
+
+                    columnMeta.Type = MapSqlType(sqlType);
+
+                    if (column.IdentityOptions != null)
+                    {
+                        columnMeta.IsIdentity = true;
+                        columnMeta.IdentitySeed = LiteralToLong(column.IdentityOptions.IdentitySeed, 1);
+                        columnMeta.IdentityIncrement = LiteralToLong(column.IdentityOptions.IdentityIncrement, 1);
+                        columnMeta.IdentityCurrent = columnMeta.IdentitySeed - columnMeta.IdentityIncrement;
+                        columnMeta.Nullable = false;
+                    }
+
+                    foreach (var constraint in column.Constraints)
+                    {
+                        switch (constraint)
+                        {
+                            case NullableConstraintDefinition nullable:
+                                columnMeta.Nullable = nullable.Nullable;
+                                break;
+                            case DefaultConstraintDefinition def:
+                                columnMeta.DefaultSql = GenerateSql(def.Expression);
+                                break;
+                            case UniqueConstraintDefinition unique when unique.IsPrimaryKey:
+                                columnMeta.Nullable = false;
+                                break;
+                        }
+                    }
+                }
+
+                types[name] = columnMeta.Type;
                 order.Add(name);
+                meta.Columns.Add(columnMeta);
             }
 
-            var filePath = Path.Combine(tablesDir, $"{tableName}.parquet");
             if (File.Exists(filePath))
             {
                 throw new Exception($"Table [{tableName}] already exists.");
@@ -802,47 +1356,31 @@
 
             var data = order.ToDictionary(c => c, _ => new List<object?>());
             this.WriteTableAsync(filePath, order, types, data).GetAwaiter().GetResult();
+            SaveMeta(filePath, meta);
         }
 
-        private void InsertRows(string filePath, string tableName, List<string> columnNames, List<List<ScalarExpression>> rows)
+        private static long LiteralToLong(ScalarExpression? expression, long fallback)
         {
-            if (!File.Exists(filePath))
+            return expression switch
             {
-                throw new Exception($"Table [{tableName}] does not exist.");
-            }
+                IntegerLiteral i => long.Parse(i.Value, CultureInfo.InvariantCulture),
+                NumericLiteral n => (long)decimal.Parse(n.Value, CultureInfo.InvariantCulture),
+                UnaryExpression { UnaryExpressionType: UnaryExpressionType.Negative } u => -LiteralToLong(u.Expression, fallback),
+                null => fallback,
+                _ => fallback,
+            };
+        }
 
-            var table = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
-            var insertColumns = columnNames.Count > 0 ? columnNames : table.Order;
-
-            foreach (var col in insertColumns)
+        private static string InferComputedType(ScalarExpression expression)
+        {
+            var target = expression switch
             {
-                if (!table.Types.ContainsKey(col))
-                {
-                    throw new ArgumentException($"Column [{col}] does not exist in table [{tableName}].");
-                }
-            }
+                ConvertCall c => c.DataType,
+                CastCall c => c.DataType,
+                _ => null,
+            };
 
-            foreach (var rowValues in rows)
-            {
-                if (rowValues.Count != insertColumns.Count)
-                {
-                    throw new ArgumentException(
-                        $"Column count ({insertColumns.Count}) does not match value count ({rowValues.Count}).");
-                }
-
-                var provided = new Dictionary<string, object?>();
-                for (var i = 0; i < insertColumns.Count; i++)
-                {
-                    provided[insertColumns[i]] = ConvertSqlValue(rowValues[i], table.Types[insertColumns[i]]);
-                }
-
-                foreach (var col in table.Order)
-                {
-                    table.Data[col].Add(provided.TryGetValue(col, out var v) ? v : null);
-                }
-            }
-
-            this.WriteTableAsync(filePath, table.Order, table.Types, table.Data).GetAwaiter().GetResult();
+            return target?.Name?.BaseIdentifier?.Value is string sqlType ? MapSqlType(sqlType) : "decimal";
         }
 
         private async Task<TableData> LoadTableAsync(string filePath)
@@ -1023,7 +1561,7 @@
             throw new NotSupportedException($"Unsupported column CLR type: {clrType.Name}");
         }
 
-        private static string DatabasesRoot() => Path.Combine(AppContext.BaseDirectory, "databases");
+        private static string DatabasesRoot() => ParqBase.DatabasesRoot;
 
         private static bool IsSystemCatalog(NamedTableReference tableRef, string viewName)
         {
@@ -1034,6 +1572,28 @@
         }
 
         private string TablesDirectory() => Path.Combine(this.RequireDatabasePath(), "tables");
+
+        /// <summary>
+        /// Splits a table reference into (schema, table), defaulting an unqualified name to dbo.
+        /// </summary>
+        private (string Schema, string Table) ResolveTableName(SchemaObjectName name)
+        {
+            var schema = name.SchemaIdentifier?.Value ?? Security.SecurityCatalog.DboSchema;
+            return (schema, name.BaseIdentifier.Value);
+        }
+
+        /// <summary>
+        /// Maps a (schema, table) pair to its Parquet file. dbo tables keep their historical
+        /// flat name (tables/&lt;table&gt;.parquet); other schemas are namespaced by prefixing
+        /// the schema (tables/&lt;schema&gt;.&lt;table&gt;.parquet).
+        /// </summary>
+        private string ResolveTableFilePath(string schema, string table)
+        {
+            var fileName = string.Equals(schema, Security.SecurityCatalog.DboSchema, StringComparison.OrdinalIgnoreCase)
+                ? $"{table}.parquet"
+                : $"{schema}.{table}.parquet";
+            return Path.Combine(this.TablesDirectory(), fileName);
+        }
 
         /// <summary>
         /// Returns the currently selected database directory, throwing a descriptive
