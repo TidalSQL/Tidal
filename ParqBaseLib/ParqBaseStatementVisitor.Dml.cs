@@ -221,6 +221,7 @@ namespace ParqBaseLib
                     throw new Exception($"Table [{targetName.Table}] does not exist.");
                 }
 
+                using var _lock = TableLock.Write(filePath);
                 var table = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
                 var meta = LoadMeta(filePath);
 

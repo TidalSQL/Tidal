@@ -185,6 +185,7 @@
                     throw new Exception($"Table [{table}] does not exist.");
                 }
 
+                using var _lock = TableLock.Write(filePath);
                 var tableData = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
                 var meta = LoadMeta(filePath);
 
@@ -581,7 +582,12 @@
                         throw new Exception($"Table [{tableName}] does not exist.");
                     }
 
-                    var table = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
+                    TableData table;
+                    using (TableLock.Read(filePath))
+                    {
+                        table = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
+                    }
+
                     var schema = table.Order.Select(c => new ColumnRef(qualifier, c)).ToList();
                     var rows = new List<object?[]>();
                     for (var r = 0; r < table.RowCount; r++)
@@ -1358,6 +1364,7 @@
                 meta.Columns.Add(columnMeta);
             }
 
+            using var _lock = TableLock.Write(filePath);
             if (File.Exists(filePath))
             {
                 throw new Exception($"Table [{tableName}] already exists.");
@@ -1436,31 +1443,49 @@
             var fields = order.Select(c => BuildField(c, types[c])).ToList();
             var schema = new ParquetSchema(fields.Cast<Field>().ToList());
 
-            using Stream writeStream = File.Create(filePath);
-            using var writer = await ParquetWriter.CreateAsync(schema, writeStream);
-            writer.CompressionMethod = CompressionMethod.Gzip;
-            writer.CompressionLevel = System.IO.Compression.CompressionLevel.Optimal;
-
-            if (order.Count == 0 || data[order[0]].Count == 0)
+            // Write to a temp file first, then atomically move it into place. This guarantees a
+            // reader ever sees either the complete old file or the complete new one, never a
+            // half-written file, and a crash mid-write cannot corrupt the existing table.
+            var tempPath = filePath + ".tmp-" + Guid.NewGuid().ToString("N");
+            try
             {
-                // Schema-only (empty) table: no row group to write.
-                return;
-            }
-
-            using var groupWriter = writer.CreateRowGroup();
-            foreach (var field in schema.DataFields)
-            {
-                var col = data[field.Name];
-                Array array = types[field.Name] switch
+                using (Stream writeStream = File.Create(tempPath))
+                using (var writer = await ParquetWriter.CreateAsync(schema, writeStream))
                 {
-                    "int" => col.Select(v => (int?)v).ToArray(),
-                    "string" => col.Select(v => (string?)v).ToArray(),
-                    "datetime" => col.Select(v => (DateTime?)v).ToArray(),
-                    "decimal" => col.Select(v => (decimal?)v).ToArray(),
-                    _ => throw new NotSupportedException($"Unsupported column type: {types[field.Name]}")
-                };
+                    writer.CompressionMethod = CompressionMethod.Gzip;
+                    writer.CompressionLevel = System.IO.Compression.CompressionLevel.Optimal;
 
-                await groupWriter.WriteColumnAsync(new DataColumn(field, array));
+                    // A non-empty table gets a single row group; an empty table is schema-only.
+                    if (order.Count > 0 && data[order[0]].Count > 0)
+                    {
+                        using var groupWriter = writer.CreateRowGroup();
+                        foreach (var field in schema.DataFields)
+                        {
+                            var col = data[field.Name];
+                            Array array = types[field.Name] switch
+                            {
+                                "int" => col.Select(v => (int?)v).ToArray(),
+                                "string" => col.Select(v => (string?)v).ToArray(),
+                                "datetime" => col.Select(v => (DateTime?)v).ToArray(),
+                                "decimal" => col.Select(v => (decimal?)v).ToArray(),
+                                _ => throw new NotSupportedException($"Unsupported column type: {types[field.Name]}")
+                            };
+
+                            await groupWriter.WriteColumnAsync(new DataColumn(field, array));
+                        }
+                    }
+                }
+
+                File.Move(tempPath, filePath, overwrite: true);
+            }
+            catch
+            {
+                if (File.Exists(tempPath))
+                {
+                    try { File.Delete(tempPath); } catch { /* best effort cleanup */ }
+                }
+
+                throw;
             }
         }
 

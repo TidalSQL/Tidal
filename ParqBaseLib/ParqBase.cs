@@ -181,14 +181,23 @@
                 throw new Exception($"Table [{schema}].[{table}] does not exist in database [{database}].");
             }
 
-            var meta = ParqBaseStatementVisitor.LoadTableMeta(filePath);
-            var fileInfo = new FileInfo(filePath);
-            var rowCount = ParqBaseStatementVisitor.CountRows(filePath);
+            // Read under a shared lock so a concurrent writer's atomic file replace cannot cause a
+            // torn read or an IOException while the file is being swapped.
+            TableMeta? meta;
+            FileInfo fileInfo;
+            long rowCount;
+            IReadOnlyList<ColumnMeta> columnSource;
+            using (TableLock.Read(filePath))
+            {
+                meta = ParqBaseStatementVisitor.LoadTableMeta(filePath);
+                fileInfo = new FileInfo(filePath);
+                rowCount = ParqBaseStatementVisitor.CountRows(filePath);
 
-            // Prefer the rich metadata sidecar (created by CREATE TABLE). Tables imported as raw
-            // Parquet have no sidecar, so create one now from the column schema stored in the file.
-            var columnSource = meta?.Columns
-                ?? ParqBaseStatementVisitor.EnsureTableMeta(filePath).Columns;
+                // Prefer the rich metadata sidecar (created by CREATE TABLE). Tables imported as raw
+                // Parquet have no sidecar, so create one now from the column schema stored in the file.
+                columnSource = meta?.Columns
+                    ?? ParqBaseStatementVisitor.EnsureTableMeta(filePath).Columns;
+            }
 
             var columns = new List<TableColumnInfo>();
             for (var i = 0; i < columnSource.Count; i++)
