@@ -561,6 +561,11 @@
                         return this.BuildTablesRowSet(qualifier);
                     }
 
+                    if (IsSystemCatalog(named, "procedures"))
+                    {
+                        return this.BuildProceduresRowSet(qualifier);
+                    }
+
                     var securityView = this.TryBuildSecurityCatalog(named, qualifier);
                     if (securityView != null)
                     {
@@ -1077,6 +1082,9 @@
                 case NullLiteral:
                     return null;
 
+                case VariableReference variableReference:
+                    return this.ResolveVariable(variableReference.Name);
+
                 case ParenthesisExpression paren:
                     return this.GetScalarValue(paren.Expression, env);
 
@@ -1317,6 +1325,7 @@
                     }
 
                     columnMeta.Type = MapSqlType(sqlType);
+                    CaptureDeclaredType(column.DataType, columnMeta);
 
                     if (column.IdentityOptions != null)
                     {
@@ -1538,24 +1547,42 @@
         private static string MapClrType(Type clrType)
         {
             var underlying = Nullable.GetUnderlyingType(clrType) ?? clrType;
-            if (underlying == typeof(int))
+
+            switch (Type.GetTypeCode(underlying))
             {
-                return "int";
+                case TypeCode.Boolean:
+                case TypeCode.Byte:
+                case TypeCode.SByte:
+                case TypeCode.Int16:
+                case TypeCode.UInt16:
+                case TypeCode.Int32:
+                case TypeCode.UInt32:
+                case TypeCode.Int64:
+                case TypeCode.UInt64:
+                    return "int";
+
+                case TypeCode.Single:
+                case TypeCode.Double:
+                case TypeCode.Decimal:
+                    return "decimal";
+
+                case TypeCode.DateTime:
+                    return "datetime";
+
+                case TypeCode.Char:
+                case TypeCode.String:
+                    return "string";
             }
 
-            if (underlying == typeof(string))
-            {
-                return "string";
-            }
-
-            if (underlying == typeof(DateTime))
+            // Types the TypeCode enumeration does not cover, bucketed into a physical storage type.
+            if (underlying == typeof(DateTimeOffset) || underlying == typeof(TimeSpan))
             {
                 return "datetime";
             }
 
-            if (underlying == typeof(decimal))
+            if (underlying == typeof(Guid) || underlying == typeof(byte[]) || underlying == typeof(char[]))
             {
-                return "decimal";
+                return "string";
             }
 
             throw new NotSupportedException($"Unsupported column CLR type: {clrType.Name}");

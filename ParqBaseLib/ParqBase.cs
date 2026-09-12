@@ -148,6 +148,113 @@
         }
 
         /// <summary>
+        /// Returns catalog metadata for a single table (row count, size on disk, last modified and
+        /// per-column type information) for use by tooling such as the web UI's table overview.
+        /// Throws when the database or table does not exist.
+        /// </summary>
+        public TableInfo GetTableInfo(string database, string table, string schema = "dbo")
+        {
+            if (string.IsNullOrWhiteSpace(database))
+            {
+                throw new ArgumentException("A database name is required.", nameof(database));
+            }
+
+            if (string.IsNullOrWhiteSpace(table))
+            {
+                throw new ArgumentException("A table name is required.", nameof(table));
+            }
+
+            schema = string.IsNullOrWhiteSpace(schema) ? SecurityCatalog.DboSchema : schema;
+
+            var databasePath = Path.Combine(DatabasesRoot, database);
+            if (!Directory.Exists(databasePath))
+            {
+                throw new Exception($"Database [{database}] does not exist.");
+            }
+
+            var fileName = string.Equals(schema, SecurityCatalog.DboSchema, StringComparison.OrdinalIgnoreCase)
+                ? $"{table}.parquet"
+                : $"{schema}.{table}.parquet";
+            var filePath = Path.Combine(databasePath, "tables", fileName);
+            if (!File.Exists(filePath))
+            {
+                throw new Exception($"Table [{schema}].[{table}] does not exist in database [{database}].");
+            }
+
+            var meta = ParqBaseStatementVisitor.LoadTableMeta(filePath);
+            var fileInfo = new FileInfo(filePath);
+            var rowCount = ParqBaseStatementVisitor.CountRows(filePath);
+
+            // Prefer the rich metadata sidecar (created by CREATE TABLE). Tables imported as raw
+            // Parquet have no sidecar, so create one now from the column schema stored in the file.
+            var columnSource = meta?.Columns
+                ?? ParqBaseStatementVisitor.EnsureTableMeta(filePath).Columns;
+
+            var columns = new List<TableColumnInfo>();
+            for (var i = 0; i < columnSource.Count; i++)
+            {
+                var column = columnSource[i];
+                var (dataType, maxLength, precision, scale) =
+                    ParqBaseStatementVisitor.DescribeColumnType(column);
+                columns.Add(new TableColumnInfo(
+                    i,
+                    column.Name,
+                    dataType,
+                    column.Nullable,
+                    maxLength,
+                    precision,
+                    scale,
+                    column.IsIdentity,
+                    column.DefaultSql,
+                    column.ComputedSql));
+            }
+
+            return new TableInfo(
+                database,
+                schema,
+                table,
+                rowCount,
+                columns.Count,
+                fileInfo.Length,
+                fileInfo.LastWriteTime,
+                columns);
+        }
+
+        /// <summary>
+        /// Returns the T-SQL definition (a CREATE OR ALTER PROCEDURE script) for a stored procedure,
+        /// reconstructed from its persisted metadata. Throws when the database or procedure is missing.
+        /// </summary>
+        public string GetProcedureDefinition(string database, string procedure, string schema = "dbo")
+        {
+            if (string.IsNullOrWhiteSpace(database))
+            {
+                throw new ArgumentException("A database name is required.", nameof(database));
+            }
+
+            if (string.IsNullOrWhiteSpace(procedure))
+            {
+                throw new ArgumentException("A procedure name is required.", nameof(procedure));
+            }
+
+            schema = string.IsNullOrWhiteSpace(schema) ? SecurityCatalog.DboSchema : schema;
+
+            var databasePath = Path.Combine(DatabasesRoot, database);
+            if (!Directory.Exists(databasePath))
+            {
+                throw new Exception($"Database [{database}] does not exist.");
+            }
+
+            var fileName = ParqBaseStatementVisitor.ProcedureFileName(schema, procedure);
+            var filePath = Path.Combine(databasePath, "procedures", fileName);
+            if (!File.Exists(filePath))
+            {
+                throw new Exception($"Stored procedure [{schema}].[{procedure}] does not exist in database [{database}].");
+            }
+
+            return ParqBaseStatementVisitor.BuildProcedureDefinition(filePath);
+        }
+
+        /// <summary>
         /// Determines the persistent data root. Prefers the PARQBASE_DATA_ROOT environment variable,
         /// then walks up from the running assembly's location to find the ParqBaseLib project folder
         /// (the directory containing ParqBaseLib.csproj), and finally falls back to the base directory.
@@ -184,4 +291,30 @@
     /// password so a host can display it once; otherwise it is null.
     /// </summary>
     public sealed record ServerInitResult(string AdminLogin, bool Created, string? Password);
+
+    /// <summary>
+    /// Catalog metadata describing a single table, returned by <see cref="ParqBase.GetTableInfo"/>.
+    /// </summary>
+    public sealed record TableInfo(
+        string Database,
+        string Schema,
+        string Table,
+        long RowCount,
+        int ColumnCount,
+        long SizeBytes,
+        DateTime LastModified,
+        IReadOnlyList<TableColumnInfo> Columns);
+
+    /// <summary>Per-column catalog metadata for a table (approximates SQL Server's sys.columns).</summary>
+    public sealed record TableColumnInfo(
+        int ColumnId,
+        string Name,
+        string DataType,
+        bool Nullable,
+        int MaxLength,
+        int Precision,
+        int Scale,
+        bool IsIdentity,
+        string? DefaultDefinition,
+        string? ComputedDefinition);
 }

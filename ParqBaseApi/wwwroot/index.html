@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ParqBase — SQL editor</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <header class="menubar">
+        <div class="brand">
+            <span class="logo">◆</span>
+            <span>ParqBase</span>
+        </div>
+        <nav class="menu">
+            <span class="menu-item active">Home</span>
+            <span class="menu-item">Security</span>
+            <span class="menu-item">Management</span>
+            <span class="menu-item">Migration</span>
+            <span class="menu-item">Help</span>
+        </nav>
+    </header>
+
+    <div class="layout">
+        <aside class="explorer">
+            <div class="explorer-head">
+                <span>Explorer</span>
+                <button id="refreshBtn" title="Refresh" class="icon-btn">⟳</button>
+            </div>
+            <ul id="tree" class="tree"></ul>
+        </aside>
+
+        <div id="vResizer" class="resizer resizer-v" title="Drag to resize"></div>
+
+        <main class="workspace">
+            <div id="tabbar" class="tabbar"></div>
+
+            <div id="queryView" class="view">
+                <div class="toolbar">
+                    <button id="runBtn" class="run-btn">▶ Run</button>
+                    <span class="toolbar-sep"></span>
+                    <span class="db-label">Database:</span>
+                    <select id="dbSelect" class="db-select">
+                        <option value="">(none)</option>
+                    </select>
+                    <span id="status" class="status"></span>
+                </div>
+
+                <div class="editor-wrap">
+                    <div id="gutter" class="gutter"></div>
+                    <textarea id="editor" class="editor" spellcheck="false"
+                              placeholder="-- Write T-SQL here, then press Run (or Ctrl+Enter)">SELECT name FROM sys.databases;</textarea>
+                </div>
+
+                <div id="hResizer" class="resizer resizer-h" title="Drag to resize"></div>
+
+                <div class="results">
+                    <div class="result-tabs">
+                        <div id="tabResults" class="result-tab active">Results</div>
+                        <div id="tabMessages" class="result-tab">Messages</div>
+                    </div>
+                    <div class="result-body">
+                        <div id="resultsPane" class="pane active">
+                            <div id="gridWrap" class="grid-wrap"></div>
+                        </div>
+                        <div id="messagesPane" class="pane">
+                            <pre id="messages" class="messages"></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="tableView" class="view hidden"></div>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
