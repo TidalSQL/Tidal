@@ -5,6 +5,7 @@ const $ = (id) => document.getElementById(id);
 const editor = $("editor");
 const gutter = $("gutter");
 const runBtn = $("runBtn");
+const cancelBtn = $("cancelBtn");
 const dbSelect = $("dbSelect");
 const statusEl = $("status");
 const treeEl = $("tree");
@@ -105,8 +106,13 @@ $("tabResults").addEventListener("click", () => showTab("results"));
 $("tabMessages").addEventListener("click", () => showTab("messages"));
 
 // ---- explorer tree -------------------------------------------------------------
+// Databases the user has expanded in the tree. Tracked so the explorer can rebuild
+// itself (e.g. after DDL) without losing which nodes were open.
+const expandedDbs = new Set();
+
 async function loadDatabases() {
     treeEl.innerHTML = "";
+    const previousSelection = dbSelect.value;
     dbSelect.innerHTML = '<option value="">(none)</option>';
     let dbs = [];
     try {
@@ -123,6 +129,17 @@ async function loadDatabases() {
         dbSelect.appendChild(opt);
     }
     if (dbs.length === 0) treeEl.innerHTML = '<li class="empty">No databases.</li>';
+
+    // Forget any expanded databases that no longer exist, and keep the selected database
+    // in the dropdown if it is still available.
+    for (const n of [...expandedDbs]) if (!dbs.includes(n)) expandedDbs.delete(n);
+    if (dbs.includes(previousSelection)) dbSelect.value = previousSelection;
+}
+
+// Rebuilds the explorer while preserving expanded nodes and the selected database. Called
+// after statements that change the catalog so newly created/dropped objects show up at once.
+async function refreshExplorer() {
+    await loadDatabases();
 }
 
 function makeDatabaseNode(name) {
@@ -132,19 +149,34 @@ function makeDatabaseNode(name) {
     children.className = "children collapsed";
     let loaded = false;
 
+    async function expand() {
+        children.classList.remove("collapsed");
+        node.querySelector(".twisty").textContent = "▼";
+        expandedDbs.add(name);
+        loaded = true;
+        children.innerHTML = "";
+        children.appendChild(loadingNode());
+        await loadObjects(name, children);
+    }
+
+    function collapse() {
+        children.classList.add("collapsed");
+        node.querySelector(".twisty").textContent = "▶";
+        expandedDbs.delete(name);
+    }
+
     node.addEventListener("click", async () => {
-        const collapsed = children.classList.toggle("collapsed");
-        node.querySelector(".twisty").textContent = collapsed ? "▶" : "▼";
         dbSelect.value = name;
-        if (!collapsed && !loaded) {
-            loaded = true;
-            children.appendChild(loadingNode());
-            await loadObjects(name, children);
-        }
+        if (children.classList.contains("collapsed")) await expand();
+        else collapse();
     });
 
     li.appendChild(node);
     li.appendChild(children);
+
+    // Re-expand automatically if this database was open before a refresh.
+    if (expandedDbs.has(name)) { expand(); }
+
     return li;
 }
 
@@ -271,7 +303,11 @@ function paintTableView(tab) {
         <div class="tv-body" id="tvBody"></div>`;
 
     tableView.querySelectorAll(".tv-subtab").forEach((el) =>
-        el.addEventListener("click", () => { tab.mode = el.dataset.mode; paintTableView(tab); }));
+        el.addEventListener("click", () => {
+            if (tab._streamAbort) { tab._streamAbort.abort(); tab._streamAbort = null; }
+            tab.mode = el.dataset.mode;
+            paintTableView(tab);
+        }));
 
     const body = $("tvBody");
     if (tab.mode === "overview") body.appendChild(overviewSection(tab, tab.info));
@@ -369,28 +405,146 @@ function typeIndicator(dataType) {
 }
 
 async function loadPreview(tab, body) {
-    body.innerHTML = '<div class="empty">Loading preview…</div>';
-    try {
-        const res = await fetch("/api/sql", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                statement: `SELECT TOP (100) * FROM [${tab.info.schema}].[${tab.info.table}];`,
-                database: tab.db,
-            }),
-        });
-        const data = await res.json();
-        body.innerHTML = "";
-        if (data.columns && data.columns.length > 0) {
-            const gw = document.createElement("div");
-            gw.className = "grid-wrap preview-grid";
-            gw.appendChild(dataGrid(data.columns, data.rows));
-            body.appendChild(gw);
-        } else {
-            body.innerHTML = `<div class="empty">${escapeHtml(data.message || "No rows.")}</div>`;
+    // Cancel any previous stream still running for this tab (e.g. user re-entered the subtab).
+    if (tab._streamAbort) { tab._streamAbort.abort(); tab._streamAbort = null; }
+
+    const BATCH_SIZE = 10000;   // rows per NDJSON batch requested from the server
+    const MAX_RENDER = 20000;   // cap DOM rows so a 500k-row table can't freeze the browser
+
+    body.innerHTML = "";
+    const toolbar = document.createElement("div");
+    toolbar.className = "stream-toolbar";
+    const status = document.createElement("span");
+    status.className = "stream-status";
+    status.textContent = "Connecting…";
+    const stopBtn = document.createElement("button");
+    stopBtn.className = "action-btn";
+    stopBtn.innerHTML = '<span class="a-icon">■</span><span class="a-label">Stop</span>';
+    toolbar.appendChild(status);
+    toolbar.appendChild(stopBtn);
+    body.appendChild(toolbar);
+
+    const gw = document.createElement("div");
+    gw.className = "grid-wrap preview-grid";
+    body.appendChild(gw);
+
+    const controller = new AbortController();
+    tab._streamAbort = controller;
+    stopBtn.addEventListener("click", () => controller.abort());
+
+    let table = null;
+    let tbody = null;
+    let columns = null;
+    let total = 0;
+    let rendered = 0;
+    let received = 0;
+    let capped = false;
+
+    const buildGrid = (cols) => {
+        table = document.createElement("table");
+        table.className = "grid";
+        const htr = document.createElement("tr");
+        htr.appendChild(th(""));
+        for (const c of cols) htr.appendChild(th(c));
+        const thd = document.createElement("thead");
+        thd.appendChild(htr);
+        table.appendChild(thd);
+        tbody = document.createElement("tbody");
+        table.appendChild(tbody);
+        gw.appendChild(table);
+    };
+
+    const appendRows = (start, rows) => {
+        const frag = document.createDocumentFragment();
+        for (let r = 0; r < rows.length && rendered < MAX_RENDER; r++) {
+            const values = rows[r];
+            const tr = document.createElement("tr");
+            const rn = document.createElement("td");
+            rn.className = "rownum";
+            rn.textContent = (start + r + 1).toLocaleString();
+            tr.appendChild(rn);
+            for (let c = 0; c < columns.length; c++) {
+                const cell = document.createElement("td");
+                const v = values[c];
+                if (v === null || v === undefined) { cell.textContent = "NULL"; cell.className = "null"; }
+                else cell.textContent = String(v);
+                tr.appendChild(cell);
+            }
+            frag.appendChild(tr);
+            rendered++;
         }
+        tbody.appendChild(frag);
+        if (rendered >= MAX_RENDER && !capped) capped = true;
+    };
+
+    const updateStatus = (done) => {
+        const totalLabel = total.toLocaleString();
+        if (done) {
+            const shown = capped ? `showing first ${rendered.toLocaleString()} of ` : "";
+            status.textContent = `Loaded ${received.toLocaleString()} row(s) — ${shown}${totalLabel} total`;
+        } else {
+            status.textContent = `Streaming… ${received.toLocaleString()} / ${totalLabel} row(s)`;
+        }
+    };
+
+    const url = `/api/databases/${encodeURIComponent(tab.db)}/tables/${encodeURIComponent(tab.info.table)}`
+        + `/stream?schema=${encodeURIComponent(tab.info.schema)}&batchSize=${BATCH_SIZE}`;
+
+    try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+            let msg = `HTTP ${res.status}`;
+            try { msg = (await res.json()).message || msg; } catch { /* ignore */ }
+            throw new Error(msg);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let bufferText = "";
+
+        const handleLine = (line) => {
+            if (!line) return;
+            const obj = JSON.parse(line);
+            if (columns === null) {
+                columns = obj.columns;
+                total = obj.totalRows;
+                buildGrid(columns);
+                updateStatus(false);
+                return;
+            }
+            received += obj.rows.length;
+            if (!capped) appendRows(obj.start, obj.rows);
+            updateStatus(false);
+            // Once the DOM cap is hit, stop pulling more data over the wire.
+            if (capped) controller.abort();
+        };
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            bufferText += decoder.decode(value, { stream: true });
+            let nl;
+            while ((nl = bufferText.indexOf("\n")) >= 0) {
+                const line = bufferText.slice(0, nl).trim();
+                bufferText = bufferText.slice(nl + 1);
+                handleLine(line);
+            }
+        }
+        const tailLine = bufferText.trim();
+        if (tailLine) handleLine(tailLine);
+        updateStatus(true);
     } catch (err) {
-        body.innerHTML = `<div class="empty">Preview failed: ${escapeHtml(err.message)}</div>`;
+        if (err.name === "AbortError") {
+            // User pressed Stop or the DOM cap was reached — treat as a clean end.
+            updateStatus(true);
+        } else if (!columns) {
+            body.innerHTML = `<div class="empty">Preview failed: ${escapeHtml(err.message)}</div>`;
+        } else {
+            status.textContent += " — stream ended: " + err.message;
+        }
+    } finally {
+        stopBtn.disabled = true;
+        if (tab._streamAbort === controller) tab._streamAbort = null;
     }
 }
 
@@ -403,10 +557,23 @@ function runInEditor(db, sql) {
     runQuery();
 }
 
+let queryAbort = null;
+
+// Heuristic: does this statement change the database catalog (so the explorer needs a refresh)?
+function isSchemaChange(sql) {
+    return /\b(create|alter|drop)\b\s+(or\s+(alter|replace)\s+)?(table|view|procedure|proc|function|database|schema)\b/i.test(sql);
+}
+
 async function runQuery() {
     const statement = editor.value.trim();
     if (!statement) return;
+    // Abort any in-flight query before starting a new one.
+    if (queryAbort) queryAbort.abort();
+    queryAbort = new AbortController();
+
     runBtn.disabled = true;
+    cancelBtn.style.display = "";
+    cancelBtn.disabled = false;
     setStatus("Running…", "");
     const started = performance.now();
     try {
@@ -414,17 +581,42 @@ async function runQuery() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ statement, database: dbSelect.value || null }),
+            signal: queryAbort.signal,
         });
+        if (res.status === 401) {
+            showLogin();
+            return;
+        }
         const data = await res.json();
         const elapsed = ((performance.now() - started) / 1000).toFixed(2);
         renderResult(data);
-        if (data.success) setStatus(`Completed in ${elapsed}s — ${data.rowCount} row(s)`, "ok");
-        else setStatus("Query failed", "error");
+        if (data.success) {
+            setStatus(`Completed in ${elapsed}s — ${data.rowCount} row(s)`, "ok");
+            // Auto-refresh the explorer when the statement changed the catalog so new
+            // tables/procedures/databases appear (and dropped ones disappear) immediately.
+            if (isSchemaChange(statement)) await refreshExplorer();
+        } else {
+            setStatus("Query failed", "error");
+        }
     } catch (err) {
-        renderMessages("Request failed: " + err.message, true);
-        setStatus("Error", "error");
+        if (err.name === "AbortError") {
+            renderMessages("Query cancelled.", false);
+            setStatus("Cancelled", "");
+        } else {
+            renderMessages("Request failed: " + err.message, true);
+            setStatus("Error", "error");
+        }
     } finally {
         runBtn.disabled = false;
+        cancelBtn.style.display = "none";
+        queryAbort = null;
+    }
+}
+
+function cancelQuery() {
+    if (queryAbort) {
+        queryAbort.abort();
+        cancelBtn.disabled = true;
     }
 }
 
@@ -530,6 +722,10 @@ function copyText(text) {
 
 async function fetchJson(url) {
     const res = await fetch(url);
+    if (res.status === 401) {
+        showLogin();
+        throw new Error("Not authenticated.");
+    }
     if (!res.ok) {
         let msg = res.statusText;
         try { const b = await res.json(); if (b.message) msg = b.message; } catch {}
@@ -544,6 +740,7 @@ function escapeHtml(s) {
 }
 
 runBtn.addEventListener("click", runQuery);
+cancelBtn.addEventListener("click", cancelQuery);
 $("refreshBtn").addEventListener("click", () => { tabs = [QUERY_TAB]; activateTab(QUERY_TAB.id); loadDatabases(); });
 
 // ---- draggable panel splitters -------------------------------------------------
@@ -597,7 +794,124 @@ setupResizer($("hResizer"), "y",
         editorWrapEl.style.flex = "0 0 " + clamped + "px";
     });
 
+// ---- authentication ------------------------------------------------------------
+// The session lives in an HttpOnly cookie set by /api/login; the UI only tracks display state.
+const loginOverlay = $("loginOverlay");
+const loginForm = $("loginForm");
+const loginUser = $("loginUser");
+const loginPass = $("loginPass");
+const loginError = $("loginError");
+const userbox = $("userbox");
+const userName = $("userName");
+let authUser = null;
+let authIsAdmin = false;
+
+function showLogin() {
+    authUser = null;
+    userbox.style.display = "none";
+    loginOverlay.style.display = "flex";
+    // Clear any data from a previous session so a signed-out user sees nothing.
+    treeEl.innerHTML = "";
+    dbSelect.innerHTML = '<option value="">(none)</option>';
+    tabs = [QUERY_TAB];
+    activeTabId = QUERY_TAB.id;
+    renderTabs();
+    activateTab(QUERY_TAB.id);
+    loginError.textContent = "";
+    loginPass.value = "";
+    setTimeout(() => loginUser.focus(), 0);
+}
+
+function showApp(login, isAdmin) {
+    authUser = login;
+    authIsAdmin = isAdmin;
+    userName.textContent = isAdmin ? `${login} (admin)` : login;
+    userbox.style.display = "flex";
+    loginOverlay.style.display = "none";
+    loadDatabases();
+}
+
+async function initAuth() {
+    try {
+        const me = await (await fetch("/api/me")).json();
+        if (me && me.authenticated) {
+            showApp(me.login, me.isAdmin);
+            return;
+        }
+    } catch {}
+    showLogin();
+}
+
+loginForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    loginError.textContent = "";
+    const btn = $("loginSubmit");
+    btn.disabled = true;
+    try {
+        const res = await fetch("/api/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username: loginUser.value.trim(), password: loginPass.value }),
+        });
+        if (!res.ok) {
+            let msg = "Invalid login or password.";
+            try { const b = await res.json(); if (b.message) msg = b.message; } catch {}
+            loginError.textContent = msg;
+            return;
+        }
+        const body = await res.json();
+        showApp(body.login, body.isAdmin);
+    } catch (err) {
+        loginError.textContent = err.message || "Login failed.";
+    } finally {
+        btn.disabled = false;
+    }
+});
+
+$("logoutBtn").addEventListener("click", async () => {
+    try { await fetch("/api/logout", { method: "POST" }); } catch {}
+    showLogin();
+});
+
+// ---- my access (effective permissions) -----------------------------------------
+const accessModal = $("accessModal");
+$("accessClose").addEventListener("click", () => { accessModal.style.display = "none"; });
+$("accessBtn").addEventListener("click", showMyAccess);
+
+async function showMyAccess() {
+    const db = dbSelect.value;
+    const title = $("accessTitle");
+    const body = $("accessBody");
+    accessModal.style.display = "flex";
+    if (!db) {
+        title.textContent = "My permissions";
+        body.innerHTML = '<div class="empty">Select a database first to see your permissions in it.</div>';
+        return;
+    }
+    title.textContent = `My permissions in [${db}]`;
+    body.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+        const perms = await fetchJson(`/api/me/permissions?database=${encodeURIComponent(db)}`);
+        if (!perms.length) {
+            body.innerHTML = '<div class="empty">You have no explicit permissions in this database.</div>';
+            return;
+        }
+        let html = '<table class="access-table"><thead><tr>' +
+            '<th>Grantee</th><th>Permission</th><th>Class</th><th>Securable</th><th>State</th>' +
+            '</tr></thead><tbody>';
+        for (const p of perms) {
+            const cls = /DENY/i.test(p.state) ? "deny" : "grant";
+            html += `<tr class="${cls}"><td>${escapeHtml(p.grantee)}</td><td>${escapeHtml(p.permission)}</td>` +
+                `<td>${escapeHtml(p.class)}</td><td>${escapeHtml(p.securable)}</td><td>${escapeHtml(p.state)}</td></tr>`;
+        }
+        html += "</tbody></table>";
+        body.innerHTML = html;
+    } catch (err) {
+        body.innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    }
+}
+
 // init
 renderTabs();
 syncGutter();
-loadDatabases();
+initAuth();

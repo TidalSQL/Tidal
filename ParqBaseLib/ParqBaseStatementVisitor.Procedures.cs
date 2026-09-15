@@ -435,6 +435,7 @@ namespace ParqBaseLib
 
             var schema = new List<ColumnRef> { new(qualifier, "name") };
             var rows = procedures
+                .Where(p => this.CanViewObjectByName(p.Name))
                 .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
                 .Select(p => new object?[] { p.Name })
                 .ToList();

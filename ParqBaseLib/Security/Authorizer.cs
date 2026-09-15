@@ -23,6 +23,7 @@ namespace ParqBaseLib.Security
         Execute,
         CreateObject,
         AlterObject,
+        ViewDefinition,
     }
 
     /// <summary>
@@ -135,6 +136,69 @@ namespace ParqBaseLib.Security
             return this.HasFixedRoleGrant(principals, action);
         }
 
+        /// <summary>
+        /// Metadata visibility for an object: true when the user may see that the object exists. A
+        /// non-owner has no visibility until explicitly granted — either VIEW DEFINITION, or any
+        /// object permission (SELECT/INSERT/UPDATE/DELETE/EXECUTE/ALTER) that implies awareness of it.
+        /// sysadmin, db_owner, and schema owners see everything they control.
+        /// </summary>
+        public bool CanViewObject(string user, string schema, string obj)
+        {
+            var actions = new[]
+            {
+                SecurityAction.ViewDefinition,
+                SecurityAction.Select,
+                SecurityAction.Insert,
+                SecurityAction.Update,
+                SecurityAction.Delete,
+                SecurityAction.Execute,
+                SecurityAction.AlterObject,
+            };
+
+            foreach (var action in actions)
+            {
+                if (this.CanAccessObject(user, action, schema, obj))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// True when the user has any access at all within the database: they are a sysadmin, the
+        /// database owner, a member of a fixed database role, own a schema, or hold at least one
+        /// granted (non-denied) permission. Used to hide databases from mapped users who have not yet
+        /// been granted anything, so access is default-deny until permissions are assigned.
+        /// </summary>
+        public bool HasAnyAccess(string user)
+        {
+            if (this.IsSysadmin(user))
+            {
+                return true;
+            }
+
+            var principals = this.EffectivePrincipals(user);
+            if (principals.Contains("db_owner") ||
+                principals.Contains("db_datareader") ||
+                principals.Contains("db_datawriter") ||
+                principals.Contains("db_executor") ||
+                principals.Contains("db_ddladmin") ||
+                principals.Contains("db_securityadmin"))
+            {
+                return true;
+            }
+
+            if (this.catalog.GetSchemas().Any(s => principals.Contains(s.Owner)))
+            {
+                return true;
+            }
+
+            return this.catalog.GetPermissions().Any(p =>
+                p.State == PermissionState.Grant && principals.Contains(p.Grantee));
+        }
+
         private bool HasFixedRoleGrant(HashSet<string> principals, SecurityAction action)
         {
             switch (action)
@@ -150,6 +214,12 @@ namespace ParqBaseLib.Security
                 case SecurityAction.CreateObject:
                 case SecurityAction.AlterObject:
                     return principals.Contains("db_ddladmin");
+                case SecurityAction.ViewDefinition:
+                    // Any fixed role that carries an object privilege also implies visibility.
+                    return principals.Contains("db_datareader") ||
+                        principals.Contains("db_datawriter") ||
+                        principals.Contains("db_executor") ||
+                        principals.Contains("db_ddladmin");
                 default:
                     return false;
             }
@@ -190,6 +260,10 @@ namespace ParqBaseLib.Security
                 case SecurityAction.CreateObject:
                 case SecurityAction.AlterObject:
                     set.Add("ALTER");
+                    break;
+                case SecurityAction.ViewDefinition:
+                    set.Add("VIEW DEFINITION");
+                    set.Add("VIEW");
                     break;
             }
 

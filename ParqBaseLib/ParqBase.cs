@@ -3,9 +3,12 @@
     using System;
     using System.Collections.Generic;
     using System.IO;
+    using System.Linq;
+    using System.Runtime.CompilerServices;
+    using System.Threading;
     using ParqBaseLib.Security;
 
-    public class ParqBase
+    public partial class ParqBase
     {
         private readonly SessionContext session = new();
         private readonly object gate = new();
@@ -97,18 +100,254 @@
             }
         }
 
+        /// <summary>True when the authenticated login is a member of the sysadmin server role.</summary>
+        public bool CurrentLoginIsSysadmin => this.session.IsSysadminLogin;
+
+        /// <summary>
+        /// Establishes the session for a login that has already been authenticated elsewhere (for
+        /// example a web host that verified credentials once and now resumes the session from a token).
+        /// Records the login and whether it is a sysadmin, without re-checking the password.
+        /// </summary>
+        public void ResumeLogin(string loginName)
+        {
+            if (string.IsNullOrWhiteSpace(loginName))
+            {
+                throw new ArgumentException("A login name is required.", nameof(loginName));
+            }
+
+            lock (this.gate)
+            {
+                var catalog = new SecurityCatalog(SystemRoot, null);
+                this.session.CurrentLogin = loginName;
+                this.session.IsSysadminLogin = catalog.IsServerRoleMember("sysadmin", loginName);
+            }
+        }
+
+        /// <summary>Clears all authentication and impersonation state for this session (log out).</summary>
+        public void Logout()
+        {
+            lock (this.gate)
+            {
+                this.session.CurrentLogin = null;
+                this.session.IsSysadminLogin = false;
+                this.session.AutoUser = null;
+                this.session.CurrentDatabasePath = null;
+            }
+        }
+
+        /// <summary>
+        /// Lists the databases the currently authenticated login may access: every database for a
+        /// sysadmin, and for a constrained login those in which it maps to a database user. Returns an
+        /// empty list when no login is authenticated, so a logged-out session sees no databases.
+        /// </summary>
+        public IReadOnlyList<string> ListAccessibleDatabases()
+        {
+            lock (this.gate)
+            {
+                var login = this.session.CurrentLogin;
+                if (login == null)
+                {
+                    return Array.Empty<string>();
+                }
+
+                var all = Directory.Exists(DatabasesRoot)
+                    ? Directory.GetDirectories(DatabasesRoot)
+                        .Select(Path.GetFileName)
+                        .Where(n => !string.IsNullOrEmpty(n))
+                        .Select(n => n!)
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                        .ToList()
+                    : new List<string>();
+
+                if (this.session.IsSysadminLogin)
+                {
+                    return all;
+                }
+
+                var accessible = new List<string>();
+                foreach (var db in all)
+                {
+                    var dbPath = Path.Combine(DatabasesRoot, db);
+                    var catalog = new SecurityCatalog(SystemRoot, dbPath);
+                    var user = catalog.GetPrincipals().FirstOrDefault(p =>
+                        p.Kind == PrincipalKind.User &&
+                        string.Equals(p.LoginName, login, StringComparison.OrdinalIgnoreCase));
+                    if (user != null && new Authorizer(catalog).HasAnyAccess(user.Name))
+                    {
+                        accessible.Add(db);
+                    }
+                }
+
+                return accessible;
+            }
+        }
+
+        /// <summary>
+        /// Returns whether the current login may read (SELECT) a table, honouring GRANT/DENY, roles,
+        /// ownership and fixed roles. A sysadmin (or an unauthenticated programmatic session) may read
+        /// anything. Used by the web host to authorize direct table reads that bypass the SQL engine.
+        /// </summary>
+        public bool CanReadTable(string database, string table, string schema = "dbo")
+        {
+            lock (this.gate)
+            {
+                if (this.session.CurrentLogin == null)
+                {
+                    return false;
+                }
+
+                if (this.session.IsSysadminLogin)
+                {
+                    return true;
+                }
+
+                schema = string.IsNullOrWhiteSpace(schema) ? SecurityCatalog.DboSchema : schema;
+                var dbPath = Path.Combine(DatabasesRoot, database);
+                if (!Directory.Exists(dbPath))
+                {
+                    return false;
+                }
+
+                var catalog = new SecurityCatalog(SystemRoot, dbPath);
+                var user = catalog.GetPrincipals().FirstOrDefault(p =>
+                    p.Kind == PrincipalKind.User &&
+                    string.Equals(p.LoginName, this.session.CurrentLogin, StringComparison.OrdinalIgnoreCase));
+                if (user == null)
+                {
+                    return false;
+                }
+
+                return new Authorizer(catalog).CanAccessObject(user.Name, SecurityAction.Select, schema, table);
+            }
+        }
+
+        /// <summary>
+        /// Returns whether the current login may see the metadata/definition of an object (a table,
+        /// view, or stored procedure) — i.e. holds VIEW DEFINITION or any object permission on it.
+        /// This is the "view" tier, distinct from reading data (<see cref="CanReadTable"/>). A sysadmin
+        /// (or an unauthenticated programmatic session) may view anything. Used by the web host to gate
+        /// table-overview and procedure-definition endpoints.
+        /// </summary>
+        public bool CanViewObject(string database, string name, string schema = "dbo")
+        {
+            lock (this.gate)
+            {
+                if (this.session.CurrentLogin == null)
+                {
+                    return false;
+                }
+
+                if (this.session.IsSysadminLogin)
+                {
+                    return true;
+                }
+
+                schema = string.IsNullOrWhiteSpace(schema) ? SecurityCatalog.DboSchema : schema;
+                var dbPath = Path.Combine(DatabasesRoot, database);
+                if (!Directory.Exists(dbPath))
+                {
+                    return false;
+                }
+
+                var catalog = new SecurityCatalog(SystemRoot, dbPath);
+                var user = catalog.GetPrincipals().FirstOrDefault(p =>
+                    p.Kind == PrincipalKind.User &&
+                    string.Equals(p.LoginName, this.session.CurrentLogin, StringComparison.OrdinalIgnoreCase));
+                if (user == null)
+                {
+                    return false;
+                }
+
+                return new Authorizer(catalog).CanViewObject(user.Name, schema, name);
+            }
+        }
+
+        /// <summary>
+        /// Lists the effective permissions of the current login within a database — the GRANT/DENY
+        /// rows that apply to the login's user (directly or through role membership), plus the implicit
+        /// grants carried by the fixed database roles it belongs to. A sysadmin has full control.
+        /// Returns an empty list when the login has no access to the database.
+        /// </summary>
+        public IReadOnlyList<UserPermission> GetMyPermissions(string database)
+        {
+            lock (this.gate)
+            {
+                var login = this.session.CurrentLogin;
+                if (login == null)
+                {
+                    return Array.Empty<UserPermission>();
+                }
+
+                if (this.session.IsSysadminLogin)
+                {
+                    return new[]
+                    {
+                        new UserPermission(login, "CONTROL", "SERVER", "(all databases)", "GRANT (sysadmin)"),
+                    };
+                }
+
+                var dbPath = Path.Combine(DatabasesRoot, database);
+                if (!Directory.Exists(dbPath))
+                {
+                    throw new Exception($"Database [{database}] does not exist.");
+                }
+
+                var catalog = new SecurityCatalog(SystemRoot, dbPath);
+                var user = catalog.GetPrincipals().FirstOrDefault(p =>
+                    p.Kind == PrincipalKind.User &&
+                    string.Equals(p.LoginName, login, StringComparison.OrdinalIgnoreCase));
+                if (user == null)
+                {
+                    return Array.Empty<UserPermission>();
+                }
+
+                var authorizer = new Authorizer(catalog);
+                var principals = authorizer.EffectivePrincipals(user.Name);
+
+                var results = new List<UserPermission>();
+
+                // Explicit GRANT/DENY rows that apply to this user (via itself, its roles, or public).
+                foreach (var p in catalog.GetPermissions().Where(p => principals.Contains(p.Grantee)))
+                {
+                    results.Add(new UserPermission(
+                        p.Grantee,
+                        p.Permission,
+                        p.Class.ToString().ToUpperInvariant(),
+                        p.Securable,
+                        p.State == PermissionState.Deny ? "DENY" : "GRANT"));
+                }
+
+                // Implicit grants from fixed database roles the user belongs to.
+                void FixedRole(string role, string permission)
+                {
+                    if (principals.Contains(role))
+                    {
+                        results.Add(new UserPermission(role, permission, "DATABASE", database, "GRANT (fixed role)"));
+                    }
+                }
+
+                FixedRole("db_owner", "CONTROL");
+                FixedRole("db_datareader", "SELECT");
+                FixedRole("db_datawriter", "INSERT, UPDATE, DELETE");
+                FixedRole("db_ddladmin", "ALTER");
+                FixedRole("db_executor", "EXECUTE");
+
+                return results;
+            }
+        }
+
         public void ExecuteStatement(string statement)
         {
             this.ExecuteQuery(statement);
         }
 
-        public QueryResult ExecuteQuery(string statement)
+        public QueryResult ExecuteQuery(string statement, CancellationToken cancellationToken = default)
         {
             // A ParqBase instance represents a single logical session; serialize calls so a
             // shared instance stays consistent. Concurrency comes from using separate instances.
             lock (this.gate)
             {
-                var visitor = new ParqBaseStatementVisitor(this.session);
+                var visitor = new ParqBaseStatementVisitor(this.session, cancellationToken);
                 return visitor.Run(statement);
             }
         }
@@ -119,11 +358,11 @@
         /// are supported. Returns one <see cref="QueryResult"/> per executed statement. Execution stops
         /// at the first failure unless <paramref name="continueOnError"/> is true.
         /// </summary>
-        public IReadOnlyList<QueryResult> ExecuteScript(string script, bool continueOnError = false)
+        public IReadOnlyList<QueryResult> ExecuteScript(string script, bool continueOnError = false, CancellationToken cancellationToken = default)
         {
             lock (this.gate)
             {
-                var visitor = new ParqBaseStatementVisitor(this.session);
+                var visitor = new ParqBaseStatementVisitor(this.session, cancellationToken);
                 return visitor.RunScript(script, continueOnError);
             }
         }
@@ -300,6 +539,12 @@
     /// password so a host can display it once; otherwise it is null.
     /// </summary>
     public sealed record ServerInitResult(string AdminLogin, bool Created, string? Password);
+
+    /// <summary>
+    /// A single effective permission of the current login within a database, surfaced to the web UI's
+    /// "My Access" view. <see cref="State"/> is GRANT, DENY, or a fixed-role/sysadmin annotation.
+    /// </summary>
+    public sealed record UserPermission(string Grantee, string Permission, string Class, string Securable, string State);
 
     /// <summary>
     /// Catalog metadata describing a single table, returned by <see cref="ParqBase.GetTableInfo"/>.

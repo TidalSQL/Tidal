@@ -23,11 +23,19 @@
         public bool IsSysadminLogin { get; set; }
 
         /// <summary>
-        /// The database user the session is currently executing as (via EXECUTE AS USER), or
-        /// null when unauthenticated. A null principal is treated as a full-control administrator
-        /// so that unauthenticated sessions retain full access.
+        /// The database user a constrained (non-sysadmin) login is automatically executing as in the
+        /// current database. Set when <see cref="CurrentLogin"/> maps to a database user on USE, so
+        /// authorization applies to authenticated web sessions without an explicit EXECUTE AS. Null
+        /// for unauthenticated (programmatic) or sysadmin sessions, which retain full access.
         /// </summary>
-        public string? CurrentUser => this.impersonation.Count > 0 ? this.impersonation.Peek() : null;
+        public string? AutoUser { get; set; }
+
+        /// <summary>
+        /// The database user the session is currently executing as. An explicit EXECUTE AS USER
+        /// (the impersonation stack) takes precedence; otherwise it falls back to <see cref="AutoUser"/>
+        /// for a constrained login. Null means a full-control administrator (unauthenticated or sysadmin).
+        /// </summary>
+        public string? CurrentUser => this.impersonation.Count > 0 ? this.impersonation.Peek() : this.AutoUser;
 
         public void PushUser(string user) => this.impersonation.Push(user);
 

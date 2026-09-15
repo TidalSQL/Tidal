@@ -9,21 +9,31 @@
     using System.Globalization;
     using System.IO;
     using System.Linq;
+    using System.Threading;
     using System.Threading.Tasks;
 
     internal partial class ParqBaseStatementVisitor : TSqlFragmentVisitor
     {
         private readonly TSql160Parser sqlParser = new TSql160Parser(true, SqlEngineType.All);
         private readonly SessionContext session;
+        private readonly CancellationToken cancellation;
         private Dictionary<string, RowSet>? cteScope;
         private readonly Dictionary<string, ScalarExpression> parsedExpressionCache = new(StringComparer.Ordinal);
 
         public QueryResult LastResult { get; private set; } = new();
 
-        public ParqBaseStatementVisitor(SessionContext session)
+        public ParqBaseStatementVisitor(SessionContext session, CancellationToken cancellation = default)
         {
             this.session = session;
+            this.cancellation = cancellation;
         }
+
+        /// <summary>
+        /// Throws <see cref="OperationCanceledException"/> if the caller (e.g. the UI aborting the
+        /// request) has requested cancellation. Called from the engine's hot loops so a long-running
+        /// query stops promptly instead of reading an entire large table to completion.
+        /// </summary>
+        private void ThrowIfCancelled() => this.cancellation.ThrowIfCancellationRequested();
 
         public QueryResult Run(string statement)
         {
@@ -99,6 +109,8 @@
         {
             try
             {
+                this.AuthorizeCreateDatabase();
+
                 var root = DatabasesRoot();
                 Directory.CreateDirectory(root);
 
@@ -112,6 +124,12 @@
 
                 this.session.CurrentDatabasePath = databaseDirectory;
                 this.Catalog().SeedDatabase();
+
+                // The creating login becomes the owner (db_owner) of the new database, then the
+                // session adopts that access context so the creator immediately has full control.
+                this.GrantCreatorOwnership();
+                this.ApplyLoginContext();
+
                 this.LastResult.Message = $"Database '{node.DatabaseName.Value}' created.";
             }
             catch (Exception ex)
@@ -131,6 +149,7 @@
                 }
 
                 this.session.CurrentDatabasePath = databaseDirectory;
+                this.ApplyLoginContext();
                 this.LastResult.Message = $"Changed database context to '{node.DatabaseName.Value}'.";
             }
             catch (Exception ex)
@@ -238,6 +257,11 @@
                 var rows = new List<Dictionary<string, object?>>();
                 foreach (var values in rowSet.Rows)
                 {
+                    if ((rows.Count & 0x3FFF) == 0)
+                    {
+                        this.ThrowIfCancelled();
+                    }
+
                     var row = new Dictionary<string, object?>();
                     for (var i = 0; i < columns.Count; i++)
                     {
@@ -592,6 +616,11 @@
                     var rows = new List<object?[]>();
                     for (var r = 0; r < table.RowCount; r++)
                     {
+                        if ((r & 0x3FFF) == 0)
+                        {
+                            this.ThrowIfCancelled();
+                        }
+
                         rows.Add(table.Order.Select(c => table.Data[c][r]).ToArray());
                     }
 
@@ -955,6 +984,9 @@
                     .ToList()
                 : new List<string>();
 
+            // A constrained (non-sysadmin) authenticated login only sees databases it can access.
+            names = this.AccessibleDatabaseNames(names);
+
             var schema = new List<ColumnRef> { new(qualifier, "name") };
             var rows = names.Select(n => new object?[] { n }).ToList();
             return new RowSet(schema, rows);
@@ -985,10 +1017,34 @@
 
             var schema = new List<ColumnRef> { new(qualifier, "name") };
             var rows = tables
+                .Where(t => this.CanSeeTable(t.Name))
                 .OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase)
                 .Select(t => new object?[] { t.Name })
                 .ToList();
             return new RowSet(schema, rows);
+        }
+
+        /// <summary>
+        /// Metadata visibility: a constrained user only sees objects they have been granted visibility
+        /// of (VIEW DEFINITION or any object permission). A full-control session (unauthenticated or
+        /// sysadmin) sees everything.
+        /// </summary>
+        private bool CanSeeTable(string objectName) => this.CanViewObjectByName(objectName);
+
+        private bool CanViewObjectByName(string objectName)
+        {
+            var user = this.session.CurrentUser;
+            if (user == null)
+            {
+                return true;
+            }
+
+            var dot = objectName.IndexOf('.');
+            var schema = dot > 0 ? objectName.Substring(0, dot) : Security.SecurityCatalog.DboSchema;
+            var name = dot > 0 ? objectName.Substring(dot + 1) : objectName;
+
+            var authorizer = new Security.Authorizer(this.Catalog());
+            return authorizer.CanViewObject(user, schema, name);
         }
 
         private bool EvaluateBoolean(BooleanExpression expr, Env env)
@@ -1418,6 +1474,7 @@
 
                 for (var g = 0; g < reader.RowGroupCount; g++)
                 {
+                    this.ThrowIfCancelled();
                     using var groupReader = reader.OpenRowGroupReader(g);
                     foreach (var field in reader.Schema.DataFields)
                     {
@@ -1438,6 +1495,25 @@
             return new TableData(data, order, types, rowCount);
         }
 
+        /// <summary>
+        /// Maximum number of rows written to a single Parquet row group. Bounded groups let the
+        /// streaming reader hold only one group's worth of rows in memory at a time. Exposed as a
+        /// settable field (rather than a const) so tests can force multi-group files cheaply.
+        /// </summary>
+        internal static int RowGroupSize = 50_000;
+
+        /// <summary>Builds a strongly-typed nullable array for one row-group slice of a column.</summary>
+        private static TCol[] SliceArray<TCol>(List<object?> column, int start, int length, Func<object?, TCol> convert)
+        {
+            var array = new TCol[length];
+            for (var i = 0; i < length; i++)
+            {
+                array[i] = convert(column[start + i]);
+            }
+
+            return array;
+        }
+
         private async Task WriteTableAsync(string filePath, List<string> order, Dictionary<string, string> types, Dictionary<string, List<object?>> data)
         {
             var fields = order.Select(c => BuildField(c, types[c])).ToList();
@@ -1455,19 +1531,24 @@
                     writer.CompressionMethod = CompressionMethod.Gzip;
                     writer.CompressionLevel = System.IO.Compression.CompressionLevel.Optimal;
 
-                    // A non-empty table gets a single row group; an empty table is schema-only.
-                    if (order.Count > 0 && data[order[0]].Count > 0)
+                    // A non-empty table is split into bounded row groups; an empty table is
+                    // schema-only. Bounded row groups let readers stream the table one group at a
+                    // time with memory proportional to the group size rather than the whole table,
+                    // which is what makes streaming a 500k-row table feasible.
+                    var totalRows = order.Count > 0 ? data[order[0]].Count : 0;
+                    for (var start = 0; start < totalRows; start += RowGroupSize)
                     {
+                        var length = Math.Min(RowGroupSize, totalRows - start);
                         using var groupWriter = writer.CreateRowGroup();
                         foreach (var field in schema.DataFields)
                         {
                             var col = data[field.Name];
                             Array array = types[field.Name] switch
                             {
-                                "int" => col.Select(v => (int?)v).ToArray(),
-                                "string" => col.Select(v => (string?)v).ToArray(),
-                                "datetime" => col.Select(v => (DateTime?)v).ToArray(),
-                                "decimal" => col.Select(v => (decimal?)v).ToArray(),
+                                "int" => SliceArray(col, start, length, v => (int?)v),
+                                "string" => SliceArray(col, start, length, v => (string?)v),
+                                "datetime" => SliceArray(col, start, length, v => (DateTime?)v),
+                                "decimal" => SliceArray(col, start, length, v => (decimal?)v),
                                 _ => throw new NotSupportedException($"Unsupported column type: {types[field.Name]}")
                             };
 
@@ -1678,6 +1759,13 @@
 
         private void Fail(Exception ex)
         {
+            // Cancellation is not a query error: let it propagate so the caller (API) can treat an
+            // aborted request distinctly and stop executing the rest of the script.
+            if (ex is OperationCanceledException)
+            {
+                throw ex;
+            }
+
             this.LastResult.Success = false;
             this.LastResult.Message = ex.Message;
         }

@@ -19,6 +19,11 @@
             <span class="menu-item">Migration</span>
             <span class="menu-item">Help</span>
         </nav>
+        <div class="userbox" id="userbox" style="display:none;">
+            <button id="accessBtn" class="user-btn" title="Show my permissions">🔑 My Access</button>
+            <span class="user-chip"><span class="user-icon">👤</span><span id="userName"></span></span>
+            <button id="logoutBtn" class="user-btn">Log out</button>
+        </div>
     </header>
 
     <div class="layout">
@@ -38,6 +43,7 @@
             <div id="queryView" class="view">
                 <div class="toolbar">
                     <button id="runBtn" class="run-btn">▶ Run</button>
+                    <button id="cancelBtn" class="run-btn cancel-btn" style="display:none;">■ Cancel</button>
                     <span class="toolbar-sep"></span>
                     <span class="db-label">Database:</span>
                     <select id="dbSelect" class="db-select">
@@ -74,6 +80,31 @@
         </main>
     </div>
 
-    <script src="app.js"></script>
+            <!-- Login overlay: shown until a server login is authenticated. -->
+            <div id="loginOverlay" class="overlay">
+                <form id="loginForm" class="login-card" autocomplete="off">
+                    <div class="login-brand"><span class="logo">◆</span> ParqBase</div>
+                    <div class="login-sub">Sign in to continue</div>
+                    <label class="login-label">Login</label>
+                    <input id="loginUser" class="login-input" type="text" autocomplete="username" autofocus />
+                    <label class="login-label">Password</label>
+                    <input id="loginPass" class="login-input" type="password" autocomplete="current-password" />
+                    <div id="loginError" class="login-error"></div>
+                    <button id="loginSubmit" type="submit" class="login-btn">Sign in</button>
+                </form>
+            </div>
+
+            <!-- My Access: the current login's effective T-SQL permissions. -->
+            <div id="accessModal" class="overlay" style="display:none;">
+                <div class="access-card">
+                    <div class="access-head">
+                        <span id="accessTitle">My permissions</span>
+                        <button id="accessClose" class="user-btn">Close</button>
+                    </div>
+                    <div id="accessBody" class="access-body"></div>
+                </div>
+            </div>
+
+            <script src="app.js"></script>
 </body>
 </html>

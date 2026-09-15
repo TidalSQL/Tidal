@@ -124,6 +124,12 @@ namespace ParqBaseLib
                 var rolePrincipal = catalog.FindPrincipal(role);
                 if (rolePrincipal == null || rolePrincipal.Kind != PrincipalKind.Role)
                 {
+                    if (SecurityCatalog.FixedServerRoles.Any(r => string.Equals(r, role, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        throw new Exception(
+                            $"'{role}' is a server role, not a database role. Use 'ALTER SERVER ROLE {role} ADD MEMBER <login>' instead.");
+                    }
+
                     throw new Exception($"Role '{role}' does not exist.");
                 }
 
@@ -299,7 +305,158 @@ namespace ParqBaseLib
             }
         }
 
+        // ---- Authorization: server roles ---------------------------------------
+
+        public override void ExplicitVisit(AlterServerRoleStatement node)
+        {
+            try
+            {
+                this.AuthorizeManageServerSecurity();
+
+                var role = node.Name.Value;
+                if (!SecurityCatalog.FixedServerRoles.Contains(role, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new Exception(
+                        $"Server role '{role}' does not exist. Fixed server roles: {string.Join(", ", SecurityCatalog.FixedServerRoles)}.");
+                }
+
+                var catalog = new SecurityCatalog(SystemRoot(), null);
+                switch (node.Action)
+                {
+                    case AddMemberAlterRoleAction add:
+                    {
+                        var login = add.Member.Value;
+                        if (!catalog.LoginExists(login))
+                        {
+                            throw new Exception($"Login '{login}' does not exist. Create it with CREATE LOGIN first.");
+                        }
+
+                        catalog.AddServerRoleMember(role, login);
+                        this.LastResult.Message = $"Login '{login}' added to server role '{role}'.";
+                        break;
+                    }
+
+                    case DropMemberAlterRoleAction drop:
+                    {
+                        catalog.RemoveServerRoleMember(role, drop.Member.Value);
+                        this.LastResult.Message = $"Login '{drop.Member.Value}' removed from server role '{role}'.";
+                        break;
+                    }
+
+                    default:
+                        throw new NotSupportedException("Only ALTER SERVER ROLE ... ADD/DROP MEMBER is supported.");
+                }
+            }
+            catch (Exception ex)
+            {
+                this.Fail(ex);
+            }
+        }
+
         // ---- Authorization helpers ---------------------------------------------
+
+        /// <summary>
+        /// Authorizes creating a database. A sysadmin or a member of the dbcreator server role may
+        /// create databases. Unauthenticated (programmatic) sessions retain full control.
+        /// </summary>
+        private void AuthorizeCreateDatabase()
+        {
+            var login = this.session.CurrentLogin;
+            if (login == null || this.session.IsSysadminLogin)
+            {
+                return;
+            }
+
+            var catalog = new SecurityCatalog(SystemRoot(), null);
+            if (!catalog.IsServerRoleMember("sysadmin", login) &&
+                !catalog.IsServerRoleMember("dbcreator", login))
+            {
+                throw new Security.SecurityException(
+                    $"Permission denied: login '{login}' does not have permission to create databases (requires sysadmin or dbcreator).");
+            }
+        }
+
+        /// <summary>
+        /// Grants the login that just created a database full control over it by mapping the login to a
+        /// database user and making that user a member of db_owner. A sysadmin already bypasses checks
+        /// and an unauthenticated session has full control, so neither needs a mapping.
+        /// </summary>
+        private void GrantCreatorOwnership()
+        {
+            var login = this.session.CurrentLogin;
+            if (login == null || this.session.IsSysadminLogin)
+            {
+                return;
+            }
+
+            var catalog = this.Catalog();
+            if (!catalog.PrincipalExists(login))
+            {
+                catalog.AddPrincipal(new PrincipalRecord
+                {
+                    Name = login,
+                    Kind = PrincipalKind.User,
+                    LoginName = login,
+                    Owner = SecurityCatalog.DboSchema,
+                });
+            }
+
+            catalog.AddRoleMember("db_owner", login);
+        }
+
+        private void ApplyLoginContext()
+        {
+            this.session.AutoUser = null;
+
+            var login = this.session.CurrentLogin;
+            if (login == null || this.session.IsSysadminLogin)
+            {
+                return;
+            }
+
+            var user = this.Catalog().GetPrincipals().FirstOrDefault(p =>
+                p.Kind == PrincipalKind.User &&
+                string.Equals(p.LoginName, login, StringComparison.OrdinalIgnoreCase));
+
+            if (user == null)
+            {
+                var dbName = Path.GetFileName(this.session.CurrentDatabasePath);
+                throw new Security.SecurityException(
+                    $"Login '{login}' does not have access to database '{dbName}'.");
+            }
+
+            this.session.AutoUser = user.Name;
+        }
+
+        /// <summary>
+        /// Names of databases the current login can access: all databases for a sysadmin, and for a
+        /// constrained login those in which it maps to a database user. Used to filter catalog views
+        /// so an authenticated web user only sees databases they are permitted to use.
+        /// </summary>
+        private List<string> AccessibleDatabaseNames(List<string> all)
+        {
+            var login = this.session.CurrentLogin;
+            if (login == null || this.session.IsSysadminLogin)
+            {
+                return all;
+            }
+
+            var result = new List<string>();
+            foreach (var name in all)
+            {
+                var dbPath = Path.Combine(DatabasesRoot(), name);
+                var catalog = new Security.SecurityCatalog(SystemRoot(), dbPath);
+                var user = catalog.GetPrincipals().FirstOrDefault(p =>
+                    p.Kind == PrincipalKind.User &&
+                    string.Equals(p.LoginName, login, StringComparison.OrdinalIgnoreCase));
+                if (user != null && new Security.Authorizer(catalog).HasAnyAccess(user.Name))
+                {
+                    result.Add(name);
+                }
+            }
+
+            return result;
+        }
 
         private static string SystemRoot() => ParqBase.SystemRoot;
 
@@ -340,6 +497,27 @@ namespace ParqBaseLib
 
         private void AuthorizeManageServerSecurity()
         {
+            // Web/login sessions: server security is gated by the login's server roles, since a
+            // server-scoped action may run with no database selected (so CurrentUser is null).
+            var login = this.session.CurrentLogin;
+            if (login != null)
+            {
+                if (this.session.IsSysadminLogin)
+                {
+                    return;
+                }
+
+                var serverCatalog = new SecurityCatalog(SystemRoot(), null);
+                if (serverCatalog.IsServerRoleMember("securityadmin", login))
+                {
+                    return;
+                }
+
+                throw new Security.SecurityException(
+                    $"Permission denied: managing server security requires sysadmin or securityadmin (login '{login}').");
+            }
+
+            // Legacy EXECUTE AS model (no login authenticated): decide from the impersonated user.
             var user = this.session.CurrentUser;
             if (user == null)
             {

@@ -37,6 +37,7 @@ namespace ParqBaseLib.Security
         {
             "sysadmin",
             "securityadmin",
+            "dbcreator",
         };
 
         private static readonly JsonSerializerOptions JsonOptions = new()
@@ -134,6 +135,15 @@ namespace ParqBaseLib.Security
 
         public bool IsServerRoleMember(string role, string login) =>
             this.GetServerRoleMembers().Any(m => Eq(m.Role, role) && Eq(m.Member, login));
+
+        public void RemoveServerRoleMember(string role, string login)
+        {
+            var members = this.GetServerRoleMembers();
+            if (members.RemoveAll(m => Eq(m.Role, role) && Eq(m.Member, login)) > 0)
+            {
+                Save(this.ServerRoleMembersFile, members);
+            }
+        }
 
         // ---- Database scope ----------------------------------------------------
 
