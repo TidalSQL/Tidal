@@ -352,6 +352,14 @@
         {
             var hasAggregate = querySpec.GroupByClause != null || SelectHasAggregate(querySpec);
 
+            // Fast path: a whole-table aggregate (no WHERE/GROUP BY/HAVING) over a single physical
+            // table is answered by a single streaming pass that reads only the referenced columns and
+            // never materializes rows. Falls through to the general path when not applicable.
+            if (hasAggregate && this.TryStreamingAggregate(querySpec, outer, out var streamed))
+            {
+                return streamed;
+            }
+
             // FROM-less SELECT (e.g. a scalar subquery "(SELECT NULL)" or "SELECT 1"): evaluate the
             // projection against a single empty row.
             if (querySpec.FromClause == null || querySpec.FromClause.TableReferences.Count == 0)
