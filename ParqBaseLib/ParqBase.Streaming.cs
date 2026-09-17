@@ -80,35 +80,30 @@ namespace ParqBaseLib
                 throw new Exception($"Database [{database}] does not exist.");
             }
 
-            var fileName = string.Equals(schema, SecurityCatalog.DboSchema, StringComparison.OrdinalIgnoreCase)
-                ? $"{table}.parquet"
-                : $"{schema}.{table}.parquet";
-            var filePath = Path.Combine(databasePath, "tables", fileName);
-            if (!File.Exists(filePath))
+            var source = ParqBaseStatementVisitor.ResolveTableSource(databasePath, schema, table);
+            if (!source.Exists)
             {
                 throw new Exception($"Table [{schema}].[{table}] does not exist in database [{database}].");
             }
 
-            // Resolve the schema and total row count up front from the Parquet footer (cheap: no
+            // Resolve the schema and total row count up front from the Parquet footers (cheap: no
             // column data is read). Done under a read lock so it cannot race a writer's atomic swap.
+            // For a multi-part table the schema comes from the first part; the row count sums parts.
             List<TableStreamColumn> columns;
             long totalRows;
-            using (TableLock.Read(filePath))
+            using (TableLock.Read(source.LockKey))
             {
-                using Stream footerStream = File.OpenRead(filePath);
-                using var reader = ParquetReader.CreateAsync(footerStream).GetAwaiter().GetResult();
-                columns = new List<TableStreamColumn>();
-                foreach (var field in reader.Schema.DataFields)
+                using (Stream footerStream = File.OpenRead(source.PrimaryFile))
+                using (var reader = ParquetReader.CreateAsync(footerStream).GetAwaiter().GetResult())
                 {
-                    columns.Add(new TableStreamColumn(field.Name, ParqBaseStatementVisitor.MapClrTypeName(field.ClrType)));
+                    columns = new List<TableStreamColumn>();
+                    foreach (var field in reader.Schema.DataFields)
+                    {
+                        columns.Add(new TableStreamColumn(field.Name, ParqBaseStatementVisitor.MapClrTypeName(field.ClrType)));
+                    }
                 }
 
-                totalRows = 0;
-                for (var g = 0; g < reader.RowGroupCount; g++)
-                {
-                    using var groupReader = reader.OpenRowGroupReader(g);
-                    totalRows += groupReader.RowCount;
-                }
+                totalRows = ParqBaseStatementVisitor.CountRows(source.Files);
             }
 
             var order = columns.ConvertAll(c => c.Name);
@@ -117,7 +112,7 @@ namespace ParqBaseLib
             {
                 Columns = columns,
                 TotalRows = totalRows,
-                Batches = ParqBaseStatementVisitor.StreamTableAsync(filePath, order, batchSize, offset, limit),
+                Batches = ParqBaseStatementVisitor.StreamTableAsync(source.LockKey, source.Files, order, batchSize, offset, limit),
             };
         }
     }
@@ -127,90 +122,102 @@ namespace ParqBaseLib
         /// <summary>
         /// Streams a table's rows a Parquet row group at a time. Only one row group is decoded into
         /// memory at once, so peak memory is bounded by the row-group size regardless of table size.
-        /// The whole scan runs under a single shared read lock, giving a consistent snapshot (the file
-        /// cannot be swapped mid-scan) while still allowing concurrent readers. Row groups that fall
-        /// entirely outside the requested [offset, offset+limit) window are skipped without decoding.
+        /// The whole scan runs under a single shared read lock, giving a consistent snapshot (files
+        /// cannot be swapped mid-scan) while still allowing concurrent readers. A table may span
+        /// several part files; they are read in order and their row groups treated as one continuous
+        /// sequence. Row groups that fall entirely outside the requested [offset, offset+limit)
+        /// window are skipped without decoding.
         /// </summary>
         internal static async IAsyncEnumerable<TableRowBatch> StreamTableAsync(
-            string filePath,
+            string lockKey,
+            IReadOnlyList<string> files,
             IReadOnlyList<string> order,
             int batchSize,
             long offset,
             long? limit,
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            using var lockScope = TableLock.Read(filePath);
-            using Stream readStream = File.OpenRead(filePath);
-            using var reader = await ParquetReader.CreateAsync(readStream);
+            using var lockScope = TableLock.Read(lockKey);
 
-            var fields = reader.Schema.DataFields;
             long produced = 0;
             long globalIndex = 0;         // absolute row index of the next row to consider
             long emittedStart = offset;   // StartIndex of the batch currently being built
             var buffer = new List<object?[]>(batchSize);
             var stop = limit is { } lim ? offset + lim : long.MaxValue;
 
-            for (var g = 0; g < reader.RowGroupCount && (limit is null || produced < limit); g++)
+            foreach (var filePath in files)
             {
-                using var groupReader = reader.OpenRowGroupReader(g);
-                var groupRows = groupReader.RowCount;
-                var groupStart = globalIndex;
-                var groupEnd = globalIndex + groupRows;
-
-                // Skip whole groups that end before the window starts or begin after it ends.
-                if (groupEnd <= offset || groupStart >= stop)
+                if (limit is not null && produced >= limit)
                 {
-                    globalIndex = groupEnd;
-                    continue;
+                    break;
                 }
 
-                // Decode this group's columns (columnar read), then walk only the rows in-window.
-                var groupData = new object?[fields.Length][];
-                for (var c = 0; c < fields.Length; c++)
-                {
-                    var dataColumn = await groupReader.ReadColumnAsync(fields[c]);
-                    var src = dataColumn.Data;
-                    var col = new object?[src.Length];
-                    Array.Copy(src, col, src.Length);
-                    groupData[c] = col;
-                }
+                using Stream readStream = File.OpenRead(filePath);
+                using var reader = await ParquetReader.CreateAsync(readStream);
+                var fields = reader.Schema.DataFields;
 
-                for (var i = 0; i < groupRows; i++)
+                for (var g = 0; g < reader.RowGroupCount && (limit is null || produced < limit); g++)
                 {
-                    var abs = groupStart + i;
-                    if (abs < offset)
+                    using var groupReader = reader.OpenRowGroupReader(g);
+                    var groupRows = groupReader.RowCount;
+                    var groupStart = globalIndex;
+                    var groupEnd = globalIndex + groupRows;
+
+                    // Skip whole groups that end before the window starts or begin after it ends.
+                    if (groupEnd <= offset || groupStart >= stop)
                     {
+                        globalIndex = groupEnd;
                         continue;
                     }
 
-                    if (abs >= stop)
-                    {
-                        break;
-                    }
-
-                    var row = new object?[fields.Length];
+                    // Decode this group's columns (columnar read), then walk only the rows in-window.
+                    var groupData = new object?[fields.Length][];
                     for (var c = 0; c < fields.Length; c++)
                     {
-                        row[c] = groupData[c][i];
+                        var dataColumn = await groupReader.ReadColumnAsync(fields[c]);
+                        var src = dataColumn.Data;
+                        var col = new object?[src.Length];
+                        Array.Copy(src, col, src.Length);
+                        groupData[c] = col;
                     }
 
-                    if (buffer.Count == 0)
+                    for (var i = 0; i < groupRows; i++)
                     {
-                        emittedStart = abs;
+                        var abs = groupStart + i;
+                        if (abs < offset)
+                        {
+                            continue;
+                        }
+
+                        if (abs >= stop)
+                        {
+                            break;
+                        }
+
+                        var row = new object?[fields.Length];
+                        for (var c = 0; c < fields.Length; c++)
+                        {
+                            row[c] = groupData[c][i];
+                        }
+
+                        if (buffer.Count == 0)
+                        {
+                            emittedStart = abs;
+                        }
+
+                        buffer.Add(row);
+                        produced++;
+
+                        if (buffer.Count >= batchSize)
+                        {
+                            cancellationToken.ThrowIfCancellationRequested();
+                            yield return new TableRowBatch(emittedStart, buffer);
+                            buffer = new List<object?[]>(batchSize);
+                        }
                     }
 
-                    buffer.Add(row);
-                    produced++;
-
-                    if (buffer.Count >= batchSize)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        yield return new TableRowBatch(emittedStart, buffer);
-                        buffer = new List<object?[]>(batchSize);
-                    }
+                    globalIndex = groupEnd;
                 }
-
-                globalIndex = groupEnd;
             }
 
             if (buffer.Count > 0)

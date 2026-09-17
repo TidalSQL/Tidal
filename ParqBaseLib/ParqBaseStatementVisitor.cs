@@ -199,10 +199,7 @@
                 var (schema, table) = this.ResolveTableName(tableReference.SchemaObject);
                 this.Authorize(Security.SecurityAction.Insert, schema, table);
                 var filePath = this.ResolveTableFilePath(schema, table);
-                if (!File.Exists(filePath))
-                {
-                    throw new Exception($"Table [{table}] does not exist.");
-                }
+                this.GuardSingleFileWrite(schema, table, filePath);
 
                 using var _lock = TableLock.Write(filePath);
                 var tableData = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
@@ -600,16 +597,16 @@
                     var (schemaName, tableName) = this.ResolveTableName(named.SchemaObject);
                     this.Authorize(Security.SecurityAction.Select, schemaName, tableName);
 
-                    var filePath = this.ResolveTableFilePath(schemaName, tableName);
-                    if (!File.Exists(filePath))
+                    var source = this.ResolveTableSource(schemaName, tableName);
+                    if (!source.Exists)
                     {
                         throw new Exception($"Table [{tableName}] does not exist.");
                     }
 
                     TableData table;
-                    using (TableLock.Read(filePath))
+                    using (TableLock.Read(source.LockKey))
                     {
-                        table = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
+                        table = this.LoadTableAsync(source.Files).GetAwaiter().GetResult();
                     }
 
                     var schema = table.Order.Select(c => new ColumnRef(qualifier, c)).ToList();
@@ -996,7 +993,7 @@
         {
             var dbPath = this.RequireDatabasePath();
             var objects = new List<(string Name, string Type)>();
-            CollectObjects(dbPath, "tables", "*.parquet", "table", objects);
+            CollectTables(dbPath, objects);
             CollectObjects(dbPath, "views", "*.*", "view", objects);
             CollectObjects(dbPath, "procedures", "*.*", "procedure", objects);
             CollectObjects(dbPath, "functions", "*.*", "function", objects);
@@ -1013,7 +1010,7 @@
         {
             var dbPath = this.RequireDatabasePath();
             var tables = new List<(string Name, string Type)>();
-            CollectObjects(dbPath, "tables", "*.parquet", "table", tables);
+            CollectTables(dbPath, tables);
 
             var schema = new List<ColumnRef> { new(qualifier, "name") };
             var rows = tables

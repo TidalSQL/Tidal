@@ -411,11 +411,8 @@
                 throw new Exception($"Database [{database}] does not exist.");
             }
 
-            var fileName = string.Equals(schema, SecurityCatalog.DboSchema, StringComparison.OrdinalIgnoreCase)
-                ? $"{table}.parquet"
-                : $"{schema}.{table}.parquet";
-            var filePath = Path.Combine(databasePath, "tables", fileName);
-            if (!File.Exists(filePath))
+            var source = ParqBaseStatementVisitor.ResolveTableSource(databasePath, schema, table);
+            if (!source.Exists)
             {
                 throw new Exception($"Table [{schema}].[{table}] does not exist in database [{database}].");
             }
@@ -423,19 +420,42 @@
             // Read under a shared lock so a concurrent writer's atomic file replace cannot cause a
             // torn read or an IOException while the file is being swapped.
             TableMeta? meta;
-            FileInfo fileInfo;
+            long fileLength;
+            DateTime lastWriteTime;
             long rowCount;
             IReadOnlyList<ColumnMeta> columnSource;
-            using (TableLock.Read(filePath))
+            using (TableLock.Read(source.LockKey))
             {
-                meta = ParqBaseStatementVisitor.LoadTableMeta(filePath);
-                fileInfo = new FileInfo(filePath);
-                rowCount = ParqBaseStatementVisitor.CountRows(filePath);
+                rowCount = ParqBaseStatementVisitor.CountRows(source.Files);
 
-                // Prefer the rich metadata sidecar (created by CREATE TABLE). Tables imported as raw
-                // Parquet have no sidecar, so create one now from the column schema stored in the file.
-                columnSource = meta?.Columns
-                    ?? ParqBaseStatementVisitor.EnsureTableMeta(filePath).Columns;
+                // Aggregate on-disk size and the newest write time across every part.
+                fileLength = 0;
+                lastWriteTime = DateTime.MinValue;
+                foreach (var part in source.Files)
+                {
+                    var info = new FileInfo(part);
+                    fileLength += info.Length;
+                    if (info.LastWriteTime > lastWriteTime)
+                    {
+                        lastWriteTime = info.LastWriteTime;
+                    }
+                }
+
+                if (source.IsMultiPart)
+                {
+                    // Multi-part (directory) tables have no metadata sidecar; infer columns from the
+                    // first part's Parquet schema.
+                    meta = null;
+                    columnSource = ParqBaseStatementVisitor.ReadSchemaColumns(source.PrimaryFile);
+                }
+                else
+                {
+                    // Prefer the rich metadata sidecar (created by CREATE TABLE). Tables imported as raw
+                    // Parquet have no sidecar, so create one now from the column schema stored in the file.
+                    meta = ParqBaseStatementVisitor.LoadTableMeta(source.PrimaryFile);
+                    columnSource = meta?.Columns
+                        ?? ParqBaseStatementVisitor.EnsureTableMeta(source.PrimaryFile).Columns;
+                }
             }
 
             var columns = new List<TableColumnInfo>();
@@ -463,8 +483,8 @@
                 table,
                 rowCount,
                 columns.Count,
-                fileInfo.Length,
-                fileInfo.LastWriteTime,
+                fileLength,
+                lastWriteTime,
                 columns);
         }
 

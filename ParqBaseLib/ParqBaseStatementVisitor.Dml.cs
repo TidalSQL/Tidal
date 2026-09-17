@@ -216,10 +216,7 @@ namespace ParqBaseLib
 
                 this.Authorize(Security.SecurityAction.Update, targetName.Schema, targetName.Table);
                 var filePath = this.ResolveTableFilePath(targetName.Schema, targetName.Table);
-                if (!File.Exists(filePath))
-                {
-                    throw new Exception($"Table [{targetName.Table}] does not exist.");
-                }
+                this.GuardSingleFileWrite(targetName.Schema, targetName.Table, filePath);
 
                 using var _lock = TableLock.Write(filePath);
                 var table = this.LoadTableAsync(filePath).GetAwaiter().GetResult();
