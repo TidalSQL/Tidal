@@ -112,6 +112,130 @@ app.MapGet("/api/databases", (ParqBase db, AuthTokenStore tokens, HttpContext ht
     return Results.Ok(db.ListAccessibleDatabases());
 });
 
+// Explorer: server-scoped security. Logins and fixed server roles for the Security node.
+// Both endpoints return an empty list for non-privileged logins (see CanViewServerSecurity).
+app.MapGet("/api/server/logins", (ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    return Results.Ok(db.ListServerLogins());
+});
+
+app.MapGet("/api/server/roles", (ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    return Results.Ok(db.ListServerRoles());
+});
+
+// Explorer context menu: drop a server login. Runs through the SQL engine so the same
+// sysadmin/securityadmin authorization (and the last-sysadmin / self-drop guards) applies.
+app.MapDelete("/api/server/logins/{name}", (string name, ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    return RunServerSecurity(db, $"DROP LOGIN {QuoteName(name)};", http);
+});
+
+// Explorer context menu: create a server login.
+app.MapPost("/api/server/logins", (CreateLoginRequest body, ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    if (string.IsNullOrWhiteSpace(body?.Login))
+    {
+        return Results.BadRequest(new { message = "A login name is required." });
+    }
+
+    if (string.IsNullOrEmpty(body.Password))
+    {
+        return Results.BadRequest(new { message = "A password is required." });
+    }
+
+    return RunServerSecurity(db, $"CREATE LOGIN {QuoteName(body.Login)} WITH PASSWORD = {QuoteString(body.Password)};", http);
+});
+
+// Explorer context menu: add a login to a server role.
+app.MapPost("/api/server/roles/{role}/members", (string role, RoleMemberRequest body, ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    if (string.IsNullOrWhiteSpace(body?.Login))
+    {
+        return Results.BadRequest(new { message = "A login name is required." });
+    }
+
+    return RunServerSecurity(db, $"ALTER SERVER ROLE {QuoteName(role)} ADD MEMBER {QuoteName(body.Login)};", http);
+});
+
+// Explorer context menu: remove a login from a server role.
+app.MapDelete("/api/server/roles/{role}/members/{login}", (string role, string login, ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    return RunServerSecurity(db, $"ALTER SERVER ROLE {QuoteName(role)} DROP MEMBER {QuoteName(login)};", http);
+});
+
+// Explorer database context menu: grant a login read-only or read/write access to one database.
+app.MapPost("/api/databases/{database}/access", (string database, DatabaseAccessRequest body, ParqBase db, AuthTokenStore tokens, HttpContext http) =>
+{
+    if (!Resume(db, tokens, http))
+    {
+        return Unauthorized();
+    }
+
+    if (string.IsNullOrWhiteSpace(body?.Login))
+    {
+        return Results.BadRequest(new { message = "A login name is required." });
+    }
+
+    var levelText = (body.Level ?? string.Empty).Trim().ToLowerInvariant();
+    DatabaseAccessLevel level;
+    switch (levelText)
+    {
+        case "readonly":
+        case "read-only":
+        case "read_only":
+            level = DatabaseAccessLevel.ReadOnly;
+            break;
+        case "readwrite":
+        case "read-write":
+        case "read_write":
+            level = DatabaseAccessLevel.ReadWrite;
+            break;
+        default:
+            return Results.BadRequest(new { message = "Level must be 'readonly' or 'readwrite'." });
+    }
+
+    try
+    {
+        db.GrantDatabaseAccess(database, body.Login, level);
+        return Results.Ok(new { message = $"Granted {level} access on [{database}] to login [{body.Login}]." });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { message = ex.Message });
+    }
+});
+
 // The signed-in user's effective permissions in a database (their "T-SQL access").
 app.MapGet("/api/me/permissions", (string database, ParqBase db, AuthTokenStore tokens, HttpContext http) =>
 {
@@ -295,6 +419,34 @@ static bool Resume(ParqBase db, AuthTokenStore tokens, HttpContext http)
 static IResult Unauthorized() =>
     Results.Json(new { message = "Not authenticated." }, statusCode: StatusCodes.Status401Unauthorized);
 
+// Runs a single server-security statement (DROP LOGIN / ALTER SERVER ROLE) through the SQL engine,
+// which enforces sysadmin/securityadmin authorization, and maps the outcome to an HTTP result.
+static IResult RunServerSecurity(ParqBase db, string statement, HttpContext http)
+{
+    try
+    {
+        var result = db.ExecuteScript(statement, continueOnError: false, http.RequestAborted).Last();
+        if (!result.Success)
+        {
+            return Results.BadRequest(new { message = result.Message });
+        }
+
+        return Results.Ok(new { message = result.Message });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { message = ex.Message });
+    }
+}
+
+// Bracket-quotes a SQL identifier, doubling any embedded closing bracket, so names typed by a
+// client cannot break out of the identifier and inject SQL.
+static string QuoteName(string name) => "[" + (name ?? string.Empty).Replace("]", "]]") + "]";
+
+// Single-quotes a SQL string literal, doubling any embedded single quote, so a client-supplied
+// value cannot break out of the literal and inject SQL.
+static string QuoteString(string value) => "'" + (value ?? string.Empty).Replace("'", "''") + "'";
+
 static List<string> Column(QueryResult result, string column) =>
     result.Rows
         .Select(r => r.TryGetValue(column, out var v) ? v?.ToString() ?? string.Empty : string.Empty)
@@ -304,6 +456,12 @@ static List<string> Column(QueryResult result, string column) =>
 record LoginRequest(string Username, string Password);
 
 record SqlRequest(string Statement, string? Database);
+
+record RoleMemberRequest(string Login);
+
+record CreateLoginRequest(string Login, string Password);
+
+record DatabaseAccessRequest(string Login, string Level);
 
 /// <summary>Flattened response for the web UI: the grid comes from the last result that produced
 /// columns; messages concatenate every statement's message.</summary>

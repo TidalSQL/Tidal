@@ -13,10 +13,12 @@ namespace ParqBaseTests
         private string dbName = null!;
         private string dbPath = null!;
         private string suffix = null!;
+        private System.Collections.Generic.HashSet<string> loginsBefore = null!;
 
         [TestInitialize]
         public void TestInitialize()
         {
+            this.loginsBefore = LoginCleanup.Snapshot();
             this.suffix = Guid.NewGuid().ToString("N")[..8];
             this.dbName = "SecTest_" + this.suffix;
 
@@ -34,6 +36,7 @@ namespace ParqBaseTests
         public void TestCleanup()
         {
             try { Directory.Delete(this.dbPath, true); } catch { }
+            LoginCleanup.DropCreatedSince(this.loginsBefore);
         }
 
         private static void Ok(QueryResult r) => Assert.IsTrue(r.Success, r.Message);
@@ -309,7 +312,73 @@ namespace ParqBaseTests
                 (string)r["state"]! == "GRANT"));
         }
 
-        // ---- Authentication: default admin + login gate ------------------------
+        // ---- Server security explorer (logins & server roles) ------------------
+
+        [TestMethod]
+        public void ServerSecurity_ListsLoginsAndRoles_ManagesMembership_AndDropsLogin()
+        {
+            // Ensure a known sysadmin (login 'admin' / password 'admin') exists to read server security.
+            this.db.InitializeServer("admin");
+
+            var target = this.Login("Target");
+            Ok(this.db.ExecuteQuery($"CREATE LOGIN {target} WITH PASSWORD = 'S3cret!';"));
+            Ok(this.db.ExecuteQuery($"ALTER SERVER ROLE dbcreator ADD MEMBER {target};"));
+
+            // A signed-in sysadmin can enumerate logins and roles for the explorer's Security node.
+            var reader = new ParqBase();
+            Assert.IsTrue(reader.Login("admin", "admin"));
+
+            var logins = reader.ListServerLogins();
+            Assert.IsTrue(logins.Any(l => l.Name == target && !l.IsSysadmin), "target login should be listed");
+            Assert.IsTrue(logins.Any(l => l.Name == "admin" && l.IsSysadmin), "admin should be flagged sysadmin");
+
+            var dbcreator = reader.ListServerRoles().First(r => r.Name == "dbcreator");
+            CollectionAssert.Contains(dbcreator.Members.ToList(), target);
+
+            // An unauthenticated (non-privileged) session sees no server security.
+            Assert.AreEqual(0, new ParqBase().ListServerLogins().Count);
+
+            // Removing the role membership is reflected immediately.
+            Ok(this.db.ExecuteQuery($"ALTER SERVER ROLE dbcreator DROP MEMBER {target};"));
+            Assert.IsFalse(reader.ListServerRoles().First(r => r.Name == "dbcreator").Members.Contains(target));
+
+            // A session cannot drop the login it is signed in as (lock-out guard).
+            var self = reader.ExecuteQuery("DROP LOGIN admin;");
+            Assert.IsFalse(self.Success);
+            StringAssert.Contains(self.Message, "signed in as");
+
+            // Dropping a login removes it from the catalog.
+            Ok(this.db.ExecuteQuery($"DROP LOGIN {target};"));
+            Assert.IsFalse(reader.ListServerLogins().Any(l => l.Name == target));
+        }
+
+        [TestMethod]
+        public void GrantDatabaseAccess_ReadOnly_ThenReadWrite_EnforcesLevels()
+        {
+            var login = this.Login("Reader");
+            Ok(this.db.ExecuteQuery($"CREATE LOGIN {login} WITH PASSWORD = 'P@ssw0rd!';"));
+
+            // Read-only: SELECT allowed, INSERT denied.
+            this.db.GrantDatabaseAccess(this.dbName, login, DatabaseAccessLevel.ReadOnly);
+
+            Ok(this.db.ExecuteQuery($"EXECUTE AS USER = '{login}';"));
+            Ok(this.db.ExecuteQuery("SELECT Name FROM Customer;"));
+            var denied = this.db.ExecuteQuery("INSERT INTO Customer (Id, Name) VALUES (3, 'Carol');");
+            Assert.IsFalse(denied.Success, "read-only access should not permit INSERT.");
+            Ok(this.db.ExecuteQuery("REVERT;"));
+
+            // Read/write: INSERT now allowed. Idempotent re-run must not error on the existing user.
+            this.db.GrantDatabaseAccess(this.dbName, login, DatabaseAccessLevel.ReadWrite);
+
+            Ok(this.db.ExecuteQuery($"EXECUTE AS USER = '{login}';"));
+            Ok(this.db.ExecuteQuery("INSERT INTO Customer (Id, Name) VALUES (3, 'Carol');"));
+            Ok(this.db.ExecuteQuery("REVERT;"));
+
+            // Re-running the same grant is a no-op (idempotent), not an error.
+            this.db.GrantDatabaseAccess(this.dbName, login, DatabaseAccessLevel.ReadWrite);
+
+            Ok(this.db.ExecuteQuery($"DROP LOGIN {login};"));
+        }
 
         [TestMethod]
         public void InitializeServer_CreatesDefaultAdmin_OnlyOnce()

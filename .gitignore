@@ -75,6 +75,8 @@ StyleCopReport.xml
 *_h.h
 *.ilk
 *.meta
+# ParqBase best-effort per-table usage statistics (advisory, not source)
+.access-stats.json
 *.obj
 *.iobj
 *.pch

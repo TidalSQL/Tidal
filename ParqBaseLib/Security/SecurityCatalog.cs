@@ -92,6 +92,29 @@ namespace ParqBaseLib.Security
         }
 
         /// <summary>
+        /// Removes a login and any server-role memberships it held. Returns true when a login was
+        /// removed, false when no login of that name existed.
+        /// </summary>
+        public bool RemoveLogin(string name)
+        {
+            var logins = this.GetLogins();
+            if (logins.RemoveAll(l => Eq(l.Name, name)) == 0)
+            {
+                return false;
+            }
+
+            Save(this.LoginsFile, logins);
+
+            var members = this.GetServerRoleMembers();
+            if (members.RemoveAll(m => Eq(m.Member, name)) > 0)
+            {
+                Save(this.ServerRoleMembersFile, members);
+            }
+
+            return true;
+        }
+
+        /// <summary>
         /// Creates the default sysadmin login (and its sysadmin membership) if it does not already
         /// exist. Returns true when it was created, so callers can surface the initial credentials.
         /// </summary>

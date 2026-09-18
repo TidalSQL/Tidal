@@ -183,6 +183,141 @@
         }
 
         /// <summary>
+        /// True when the current login may view server-scoped security (logins and server roles) in the
+        /// explorer — i.e. it is a member of the fixed <c>sysadmin</c> or <c>securityadmin</c> server
+        /// roles. Server security is administrator-only; everyone else sees an empty Security node.
+        /// </summary>
+        private bool CanViewServerSecurity()
+        {
+            var login = this.session.CurrentLogin;
+            if (login == null)
+            {
+                return false;
+            }
+
+            if (this.session.IsSysadminLogin)
+            {
+                return true;
+            }
+
+            return new SecurityCatalog(SystemRoot, null).IsServerRoleMember("securityadmin", login);
+        }
+
+        /// <summary>
+        /// Lists the server logins for the explorer's Security → Logins node. Restricted to sysadmin/
+        /// securityadmin; other logins receive an empty list. Ordered by name.
+        /// </summary>
+        public IReadOnlyList<ServerLoginInfo> ListServerLogins()
+        {
+            lock (this.gate)
+            {
+                if (!this.CanViewServerSecurity())
+                {
+                    return Array.Empty<ServerLoginInfo>();
+                }
+
+                var catalog = new SecurityCatalog(SystemRoot, null);
+                return catalog.GetLogins()
+                    .OrderBy(l => l.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(l => new ServerLoginInfo(
+                        l.Name,
+                        l.Disabled,
+                        catalog.IsServerRoleMember("sysadmin", l.Name)))
+                    .ToList();
+            }
+        }
+
+        /// <summary>
+        /// Lists the fixed server roles and their login members for the explorer's Security → Server
+        /// Roles node. Restricted to sysadmin/securityadmin; other logins receive an empty list.
+        /// </summary>
+        public IReadOnlyList<ServerRoleInfo> ListServerRoles()
+        {
+            lock (this.gate)
+            {
+                if (!this.CanViewServerSecurity())
+                {
+                    return Array.Empty<ServerRoleInfo>();
+                }
+
+                var members = new SecurityCatalog(SystemRoot, null).GetServerRoleMembers();
+                return SecurityCatalog.FixedServerRoles
+                    .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+                    .Select(r => new ServerRoleInfo(
+                        r,
+                        members
+                            .Where(m => string.Equals(m.Role, r, StringComparison.OrdinalIgnoreCase))
+                            .Select(m => m.Member)
+                            .OrderBy(m => m, StringComparer.OrdinalIgnoreCase)
+                            .ToList()))
+                    .ToList();
+            }
+        }
+
+        /// <summary>
+        /// Ensures a database-scoped access role ("ReadOnly" or "ReadWrite") exists in <paramref name="database"/>,
+        /// carries the right schema-level grants, and has the given login mapped in as a member. Idempotent:
+        /// re-running never errors on an already-existing role, user, or membership. Executes through the SQL
+        /// engine so the usual db_owner/db_securityadmin/sysadmin authorization applies. Roles are inherently
+        /// per-database, so this only affects the named database.
+        /// <list type="bullet">
+        /// <item><description><b>ReadOnly</b> — GRANT SELECT on schema dbo.</description></item>
+        /// <item><description><b>ReadWrite</b> — GRANT SELECT, INSERT, UPDATE, DELETE on schema dbo.</description></item>
+        /// </list>
+        /// </summary>
+        public IReadOnlyList<QueryResult> GrantDatabaseAccess(
+            string database, string login, DatabaseAccessLevel level, CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(database))
+            {
+                throw new ArgumentException("A database name is required.", nameof(database));
+            }
+
+            if (string.IsNullOrWhiteSpace(login))
+            {
+                throw new ArgumentException("A login name is required.", nameof(login));
+            }
+
+            var dbPath = Path.Combine(DatabasesRoot, database);
+            if (!Directory.Exists(dbPath))
+            {
+                throw new Exception($"Database [{database}] does not exist.");
+            }
+
+            var roleName = level == DatabaseAccessLevel.ReadWrite ? "ReadWrite" : "ReadOnly";
+            var grants = level == DatabaseAccessLevel.ReadWrite ? "SELECT, INSERT, UPDATE, DELETE" : "SELECT";
+
+            // Read the catalog to decide which CREATE statements are needed (GRANT and ALTER ROLE ADD
+            // MEMBER are already idempotent), so re-running the operation never fails.
+            var catalog = new SecurityCatalog(SystemRoot, dbPath);
+            var rolePrincipal = catalog.FindPrincipal(roleName);
+            var roleExists = rolePrincipal != null && rolePrincipal.Kind == PrincipalKind.Role;
+            var existingUser = catalog.GetPrincipals().FirstOrDefault(p =>
+                p.Kind == PrincipalKind.User &&
+                string.Equals(p.LoginName, login, StringComparison.OrdinalIgnoreCase));
+            var userName = existingUser?.Name ?? login;
+
+            var lines = new List<string> { $"USE {Bracket(database)};", "GO" };
+            if (!roleExists)
+            {
+                lines.Add($"CREATE ROLE {Bracket(roleName)};");
+            }
+
+            lines.Add($"GRANT {grants} ON SCHEMA::{Bracket("dbo")} TO {Bracket(roleName)};");
+            if (existingUser == null)
+            {
+                lines.Add($"CREATE USER {Bracket(userName)} FOR LOGIN {Bracket(login)};");
+            }
+
+            lines.Add($"ALTER ROLE {Bracket(roleName)} ADD MEMBER {Bracket(userName)};");
+
+            return this.ExecuteScript(string.Join("\n", lines), continueOnError: false, cancellationToken);
+        }
+
+        // Bracket-quotes a SQL identifier, doubling any embedded closing bracket.
+        private static string Bracket(string name) => "[" + (name ?? string.Empty).Replace("]", "]]") + "]";
+
+        /// <summary>
         /// Returns whether the current login may read (SELECT) a table, honouring GRANT/DENY, roles,
         /// ownership and fixed roles. A sysadmin (or an unauthenticated programmatic session) may read
         /// anything. Used by the web host to authorize direct table reads that bypass the SQL engine.
@@ -422,15 +557,19 @@
             TableMeta? meta;
             long fileLength;
             DateTime lastWriteTime;
+            DateTime createdTime;
+            DateTime? lastSchemaChange;
             long rowCount;
             IReadOnlyList<ColumnMeta> columnSource;
             using (TableLock.Read(source.LockKey))
             {
                 rowCount = ParqBaseStatementVisitor.CountRows(source.Files);
 
-                // Aggregate on-disk size and the newest write time across every part.
+                // Aggregate on-disk size, the newest write time, and the earliest creation time
+                // across every part.
                 fileLength = 0;
                 lastWriteTime = DateTime.MinValue;
+                createdTime = DateTime.MaxValue;
                 foreach (var part in source.Files)
                 {
                     var info = new FileInfo(part);
@@ -439,6 +578,16 @@
                     {
                         lastWriteTime = info.LastWriteTime;
                     }
+
+                    if (info.CreationTime < createdTime)
+                    {
+                        createdTime = info.CreationTime;
+                    }
+                }
+
+                if (createdTime == DateTime.MaxValue)
+                {
+                    createdTime = lastWriteTime;
                 }
 
                 if (source.IsMultiPart)
@@ -447,6 +596,7 @@
                     // first part's Parquet schema.
                     meta = null;
                     columnSource = ParqBaseStatementVisitor.ReadSchemaColumns(source.PrimaryFile);
+                    lastSchemaChange = null;
                 }
                 else
                 {
@@ -455,6 +605,13 @@
                     meta = ParqBaseStatementVisitor.LoadTableMeta(source.PrimaryFile);
                     columnSource = meta?.Columns
                         ?? ParqBaseStatementVisitor.EnsureTableMeta(source.PrimaryFile).Columns;
+
+                    // The sidecar is (re)written by CREATE/ALTER TABLE, so its write time is the best
+                    // available proxy for the last schema (DDL) change.
+                    var metaPath = ParqBaseStatementVisitor.MetaSidecarPath(source.PrimaryFile);
+                    lastSchemaChange = File.Exists(metaPath)
+                        ? new FileInfo(metaPath).LastWriteTime
+                        : null;
                 }
             }
 
@@ -477,6 +634,9 @@
                     column.ComputedSql));
             }
 
+            var lastQueryRun = TableAccessStats.GetLastQuery(databasePath, schema, table);
+            var permissions = BuildTablePermissions(databasePath, database, schema, table);
+
             return new TableInfo(
                 database,
                 schema,
@@ -484,8 +644,58 @@
                 rowCount,
                 columns.Count,
                 fileLength,
+                source.IsMultiPart,
+                source.Files.Count,
+                createdTime,
                 lastWriteTime,
-                columns);
+                lastSchemaChange,
+                lastQueryRun,
+                columns,
+                permissions);
+        }
+
+        /// <summary>
+        /// Collects the GRANT/DENY permissions that govern a table: those defined directly on the
+        /// table, on its schema, and on the database (all three inherit down to the table). Ordered
+        /// most-specific first, DENY before GRANT, then by grantee.
+        /// </summary>
+        private static IReadOnlyList<TablePermissionInfo> BuildTablePermissions(
+            string databasePath, string database, string schema, string table)
+        {
+            var catalog = new SecurityCatalog(SystemRoot, databasePath);
+            var objectSecurable = $"{schema}.{table}";
+
+            var results = new List<TablePermissionInfo>();
+            foreach (var p in catalog.GetPermissions())
+            {
+                string? scope = p.Class switch
+                {
+                    SecurableClass.Object when string.Equals(p.Securable, objectSecurable, StringComparison.OrdinalIgnoreCase) => "Table",
+                    SecurableClass.Schema when string.Equals(p.Securable, schema, StringComparison.OrdinalIgnoreCase) => "Schema",
+                    SecurableClass.Database when string.Equals(p.Securable, database, StringComparison.OrdinalIgnoreCase) => "Database",
+                    _ => null,
+                };
+
+                if (scope == null)
+                {
+                    continue;
+                }
+
+                results.Add(new TablePermissionInfo(
+                    p.Grantee,
+                    p.Permission,
+                    p.State == PermissionState.Deny ? "DENY" : "GRANT",
+                    scope));
+            }
+
+            static int ScopeRank(string scope) => scope switch { "Table" => 0, "Schema" => 1, _ => 2 };
+
+            return results
+                .OrderBy(r => ScopeRank(r.Scope))
+                .ThenBy(r => r.State == "DENY" ? 0 : 1)
+                .ThenBy(r => r.Grantee, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(r => r.Permission, StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
         /// <summary>
@@ -567,6 +777,27 @@
     public sealed record UserPermission(string Grantee, string Permission, string Class, string Securable, string State);
 
     /// <summary>
+    /// A server login shown in the explorer's Security → Logins node. <see cref="IsSysadmin"/> marks
+    /// members of the fixed <c>sysadmin</c> server role.
+    /// </summary>
+    public sealed record ServerLoginInfo(string Name, bool Disabled, bool IsSysadmin);
+
+    /// <summary>
+    /// A fixed server role and its login members, shown in the explorer's Security → Server Roles node.
+    /// </summary>
+    public sealed record ServerRoleInfo(string Name, IReadOnlyList<string> Members);
+
+    /// <summary>
+    /// The level of database access granted by <see cref="ParqBase.GrantDatabaseAccess"/>: read-only
+    /// (SELECT) or read/write (SELECT, INSERT, UPDATE, DELETE), scoped to a single database.
+    /// </summary>
+    public enum DatabaseAccessLevel
+    {
+        ReadOnly,
+        ReadWrite,
+    }
+
+    /// <summary>
     /// Catalog metadata describing a single table, returned by <see cref="ParqBase.GetTableInfo"/>.
     /// </summary>
     public sealed record TableInfo(
@@ -576,8 +807,25 @@
         long RowCount,
         int ColumnCount,
         long SizeBytes,
-        DateTime LastModified,
-        IReadOnlyList<TableColumnInfo> Columns);
+        bool IsMultiPart,
+        int PartCount,
+        DateTime CreatedAt,
+        DateTime LastDataChange,
+        DateTime? LastSchemaChange,
+        DateTime? LastQueryRun,
+        IReadOnlyList<TableColumnInfo> Columns,
+        IReadOnlyList<TablePermissionInfo> Permissions);
+
+    /// <summary>
+    /// One GRANT/DENY entry that governs access to a table, surfaced in the table overview's
+    /// "Security and permissions" section. <see cref="Scope"/> indicates whether the permission is
+    /// defined directly on the table, on its schema, or on the database (and thus inherited).
+    /// </summary>
+    public sealed record TablePermissionInfo(
+        string Grantee,
+        string Permission,
+        string State,
+        string Scope);
 
     /// <summary>Per-column catalog metadata for a table (approximates SQL Server's sys.columns).</summary>
     public sealed record TableColumnInfo(

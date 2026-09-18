@@ -105,6 +105,23 @@
                 </div>
             </div>
 
+            <!-- New login dialog: create a server login (name + password in one dialog). -->
+            <div id="newLoginModal" class="overlay" style="display:none;">
+                <form id="newLoginForm" class="login-card" autocomplete="off">
+                    <div class="login-brand"><span class="logo">◆</span> New login</div>
+                    <div class="login-sub">Create a server login</div>
+                    <label class="login-label">Login name</label>
+                    <input id="newLoginUser" class="login-input" type="text" autocomplete="off" />
+                    <label class="login-label">Password</label>
+                    <input id="newLoginPass" class="login-input" type="password" autocomplete="new-password" />
+                    <div id="newLoginError" class="login-error"></div>
+                    <div class="modal-actions">
+                        <button type="button" id="newLoginCancel" class="login-btn secondary">Cancel</button>
+                        <button type="submit" id="newLoginSubmit" class="login-btn">Create</button>
+                    </div>
+                </form>
+            </div>
+
             <script src="app.js"></script>
 </body>
 </html>

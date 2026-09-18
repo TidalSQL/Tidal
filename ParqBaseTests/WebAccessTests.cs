@@ -21,10 +21,12 @@ namespace ParqBaseTests
         private string otherName = null!;
         private string otherPath = null!;
         private string loginName = null!;
+        private System.Collections.Generic.HashSet<string> loginsBefore = null!;
 
         [TestInitialize]
         public void TestInitialize()
         {
+            this.loginsBefore = LoginCleanup.Snapshot();
             this.suffix = Guid.NewGuid().ToString("N")[..8];
             this.dbName = "WebTest_" + this.suffix;
             this.otherName = "WebOther_" + this.suffix;
@@ -60,6 +62,7 @@ namespace ParqBaseTests
         {
             try { Directory.Delete(this.dbPath, true); } catch { }
             try { Directory.Delete(this.otherPath, true); } catch { }
+            LoginCleanup.DropCreatedSince(this.loginsBefore);
         }
 
         private static void Ok(QueryResult r) => Assert.IsTrue(r.Success, r.Message);

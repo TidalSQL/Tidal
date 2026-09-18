@@ -105,15 +105,91 @@ function showTab(which) {
 $("tabResults").addEventListener("click", () => showTab("results"));
 $("tabMessages").addEventListener("click", () => showTab("messages"));
 
+// ---- context menu --------------------------------------------------------------
+// A single floating context menu shared by the explorer. `items` is an array of
+// { label, danger?, action } — action may be async; errors surface via setStatus.
+let openMenuEl = null;
+
+function closeContextMenu() {
+    if (openMenuEl) { openMenuEl.remove(); openMenuEl = null; }
+    document.removeEventListener("mousedown", onDocDownForMenu, true);
+    document.removeEventListener("keydown", onKeyForMenu, true);
+    window.removeEventListener("blur", closeContextMenu);
+}
+
+function onDocDownForMenu(e) {
+    if (openMenuEl && !openMenuEl.contains(e.target)) closeContextMenu();
+}
+
+function onKeyForMenu(e) {
+    if (e.key === "Escape") closeContextMenu();
+}
+
+function showContextMenu(x, y, items) {
+    closeContextMenu();
+    if (!items || items.length === 0) return;
+
+    const menu = document.createElement("div");
+    menu.className = "ctx-menu";
+    for (const it of items) {
+        const el = document.createElement("div");
+        el.className = "ctx-item" + (it.danger ? " danger" : "");
+        el.textContent = it.label;
+        el.addEventListener("click", async () => {
+            closeContextMenu();
+            try {
+                await it.action();
+            } catch (err) {
+                setStatus(err.message, "error");
+            }
+        });
+        menu.appendChild(el);
+    }
+
+    document.body.appendChild(menu);
+    // Keep the menu within the viewport.
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = Math.min(x, window.innerWidth - rect.width - 4) + "px";
+    menu.style.top = Math.min(y, window.innerHeight - rect.height - 4) + "px";
+    openMenuEl = menu;
+
+    setTimeout(() => {
+        document.addEventListener("mousedown", onDocDownForMenu, true);
+        document.addEventListener("keydown", onKeyForMenu, true);
+        window.addEventListener("blur", closeContextMenu);
+    }, 0);
+}
+
+// Attaches a right-click (and long-press-friendly) context menu to a node element. `itemsFn`
+// is evaluated lazily so menus reflect current state.
+function attachContextMenu(el, itemsFn) {
+    el.classList.add("has-ctx");
+    el.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showContextMenu(e.clientX, e.clientY, itemsFn());
+    });
+}
+
 // ---- explorer tree -------------------------------------------------------------
 // Databases the user has expanded in the tree. Tracked so the explorer can rebuild
 // itself (e.g. after DDL) without losing which nodes were open.
 const expandedDbs = new Set();
 
+// Expansion state for the fixed SSMS-style folder nodes (Server, Databases, Security, …), so a
+// rebuild after DDL preserves which folders were open. Server/Databases/Security default to open.
+const expandedNodes = new Set(["server", "databases", "security"]);
+
+// Builds the whole explorer as an SSMS-style tree: a single Server node containing Databases
+// (the accessible database list) and Security (Logins, Server Roles). Keeps the name loadDatabases
+// so existing callers (refresh button, post-DDL refresh, sign-in) need no changes.
 async function loadDatabases() {
     treeEl.innerHTML = "";
     const previousSelection = dbSelect.value;
     dbSelect.innerHTML = '<option value="">(none)</option>';
+
+    // Databases are fetched up front so the query-target dropdown is populated even when the
+    // Databases folder is collapsed.
     let dbs = [];
     try {
         dbs = await fetchJson("/api/databases");
@@ -122,18 +198,259 @@ async function loadDatabases() {
         return;
     }
     for (const name of dbs) {
-        treeEl.appendChild(makeDatabaseNode(name));
         const opt = document.createElement("option");
         opt.value = name;
         opt.textContent = name;
         dbSelect.appendChild(opt);
     }
-    if (dbs.length === 0) treeEl.innerHTML = '<li class="empty">No databases.</li>';
 
     // Forget any expanded databases that no longer exist, and keep the selected database
     // in the dropdown if it is still available.
     for (const n of [...expandedDbs]) if (!dbs.includes(n)) expandedDbs.delete(n);
     if (dbs.includes(previousSelection)) dbSelect.value = previousSelection;
+
+    makeServerNode(dbs);
+}
+
+// A generic, lazily-loaded collapsible folder. Records its open/closed state in expandedNodes
+// (keyed by `key`) so it survives a rebuild, and invokes `loader(childUl)` the first time it
+// opens. Appends itself to `parentUl` and returns the children <ul>.
+function lazyFolder(parentUl, key, icon, label, loader, decorate) {
+    const li = document.createElement("li");
+    const open = expandedNodes.has(key);
+    const node = rowNode(open ? "▼" : "▶", icon, label);
+    if (decorate) decorate(node);
+    const ul = document.createElement("ul");
+    ul.className = "children" + (open ? "" : " collapsed");
+    let loaded = false;
+
+    async function expand() {
+        ul.classList.remove("collapsed");
+        node.querySelector(".twisty").textContent = "▼";
+        expandedNodes.add(key);
+        if (!loaded) {
+            loaded = true;
+            ul.innerHTML = "";
+            ul.appendChild(loadingNode());
+            await loader(ul);
+        }
+    }
+
+    function collapse() {
+        ul.classList.add("collapsed");
+        node.querySelector(".twisty").textContent = "▶";
+        expandedNodes.delete(key);
+    }
+
+    node.addEventListener("click", () =>
+        ul.classList.contains("collapsed") ? expand() : collapse());
+
+    li.appendChild(node);
+    li.appendChild(ul);
+    parentUl.appendChild(li);
+
+    if (open) expand();
+    return ul;
+}
+
+// Builds the root Server node with its Databases and Security branches.
+function makeServerNode(dbs) {
+    const label = authUser ? `${authUser} (ParqBase)` : "ParqBase";
+    lazyFolder(treeEl, "server", "🖥", label, async (serverUl) => {
+        serverUl.innerHTML = "";
+
+        lazyFolder(serverUl, "databases", "📁", "Databases", async (dbUl) => {
+            dbUl.innerHTML = "";
+            if (dbs.length === 0) {
+                dbUl.innerHTML = '<li class="empty">No databases.</li>';
+                return;
+            }
+            for (const name of dbs) dbUl.appendChild(makeDatabaseNode(name));
+        });
+
+        lazyFolder(serverUl, "security", "📁", "Security", async (secUl) => {
+            secUl.innerHTML = "";
+            lazyFolder(secUl, "logins", "📁", "Logins", loadLogins, (node) => {
+                attachContextMenu(node, () => [
+                    {
+                        label: "New login…",
+                        action: createLogin,
+                    },
+                ]);
+            });
+            lazyFolder(secUl, "serverroles", "📁", "Server Roles", loadServerRoles);
+        });
+    });
+}
+
+// Opens the "New login" modal dialog (name + password in one form). Shared by the Logins
+// folder's "New login…" context-menu item. Submission is wired in the auth section.
+function createLogin() {
+    openNewLoginModal();
+}
+
+// Login multi-selection state (SSMS-style: click, Ctrl/Cmd-click to toggle, Shift-click for a
+// range). Selection is cleared whenever the Logins list is (re)loaded.
+const selectedLogins = new Set();
+let lastLoginClickIndex = null;
+
+function applyLoginSelection(rows) {
+    for (const r of rows) r.el.classList.toggle("selected", selectedLogins.has(r.name));
+}
+
+function handleLoginClick(e, name, index, rows) {
+    if (e.shiftKey && lastLoginClickIndex !== null) {
+        if (!(e.ctrlKey || e.metaKey)) selectedLogins.clear();
+        const [a, b] = [lastLoginClickIndex, index].sort((x, y) => x - y);
+        for (let i = a; i <= b; i++) selectedLogins.add(rows[i].name);
+    } else if (e.ctrlKey || e.metaKey) {
+        if (selectedLogins.has(name)) selectedLogins.delete(name);
+        else selectedLogins.add(name);
+        lastLoginClickIndex = index;
+    } else {
+        selectedLogins.clear();
+        selectedLogins.add(name);
+        lastLoginClickIndex = index;
+    }
+    applyLoginSelection(rows);
+}
+
+// Deletes one or more logins, reporting per-login failures (e.g. self-drop / last-sysadmin guards).
+async function deleteLogins(names) {
+    if (names.length === 0) return;
+    const prompt = names.length > 1
+        ? `Delete ${names.length} logins? This cannot be undone.`
+        : `Delete login "${names[0]}"? This cannot be undone.`;
+    if (!confirm(prompt)) return;
+
+    let ok = 0;
+    const errors = [];
+    for (const n of names) {
+        try {
+            await sendJson(`/api/server/logins/${encodeURIComponent(n)}`, "DELETE");
+            ok++;
+        } catch (err) {
+            errors.push(`${n}: ${err.message}`);
+        }
+    }
+    selectedLogins.clear();
+
+    if (errors.length) {
+        setStatus(`Deleted ${ok} of ${names.length} login(s). Failed — ${errors.join("; ")}`, "error");
+    } else {
+        setStatus(`Deleted ${ok} login(s).`, "ok");
+    }
+    await refreshExplorer();
+}
+
+async function loadLogins(container) {
+    container.innerHTML = "";
+    selectedLogins.clear();
+    lastLoginClickIndex = null;
+
+    let logins = [];
+    try {
+        logins = await fetchJson("/api/server/logins");
+    } catch (err) {
+        container.innerHTML = `<li class="empty">${escapeHtml(err.message)}</li>`;
+        return;
+    }
+    if (logins.length === 0) {
+        container.innerHTML = '<li class="empty">No logins (or not authorized).</li>';
+        return;
+    }
+
+    // Rows in display order, so Shift-click can select a contiguous range.
+    const rows = [];
+    logins.forEach((l, index) => {
+        const li = document.createElement("li");
+        const label = l.disabled ? `${l.name} (disabled)` : l.name;
+        const ln = rowNode("", l.isSysadmin ? "🛡" : "👤", label);
+
+        ln.addEventListener("click", (e) => handleLoginClick(e, l.name, index, rows));
+
+        attachContextMenu(ln, () => {
+            // Right-clicking a row outside the current selection resets the selection to just it.
+            if (!selectedLogins.has(l.name)) {
+                selectedLogins.clear();
+                selectedLogins.add(l.name);
+                lastLoginClickIndex = index;
+                applyLoginSelection(rows);
+            }
+            const names = [...selectedLogins];
+            return [
+                {
+                    label: names.length > 1 ? `Delete ${names.length} logins` : `Delete login "${names[0]}"`,
+                    danger: true,
+                    action: () => deleteLogins(names),
+                },
+            ];
+        });
+
+        li.appendChild(ln);
+        container.appendChild(li);
+        rows.push({ name: l.name, el: ln });
+    });
+}
+
+async function loadServerRoles(container) {
+    container.innerHTML = "";
+    let roles = [];
+    try {
+        roles = await fetchJson("/api/server/roles");
+    } catch (err) {
+        container.innerHTML = `<li class="empty">${escapeHtml(err.message)}</li>`;
+        return;
+    }
+    if (roles.length === 0) {
+        container.innerHTML = '<li class="empty">No server roles (or not authorized).</li>';
+        return;
+    }
+    for (const r of roles) {
+        // Each role is a collapsible node whose children are its login members. Right-click the
+        // role to add a member; right-click a member to remove it.
+        lazyFolder(container, `role:${r.name}`, "🛡", r.name, async (memberUl) => {
+            memberUl.innerHTML = "";
+            if (!r.members || r.members.length === 0) {
+                memberUl.innerHTML = '<li class="empty">No members.</li>';
+                return;
+            }
+            for (const m of r.members) {
+                const li = document.createElement("li");
+                const mn = rowNode("", "👤", m);
+                attachContextMenu(mn, () => [
+                    {
+                        label: `Remove "${m}" from ${r.name}`,
+                        danger: true,
+                        action: async () => {
+                            const res = await sendJson(
+                                `/api/server/roles/${encodeURIComponent(r.name)}/members/${encodeURIComponent(m)}`,
+                                "DELETE");
+                            setStatus(res.message || `Removed "${m}" from ${r.name}.`, "ok");
+                            await refreshExplorer();
+                        },
+                    },
+                ]);
+                li.appendChild(mn);
+                memberUl.appendChild(li);
+            }
+        }, (node) => {
+            attachContextMenu(node, () => [
+                {
+                    label: `Add member to ${r.name}…`,
+                    action: async () => {
+                        const login = (prompt(`Add which login to server role "${r.name}"?`) || "").trim();
+                        if (!login) return;
+                        const res = await sendJson(
+                            `/api/server/roles/${encodeURIComponent(r.name)}/members`,
+                            "POST", { login });
+                        setStatus(res.message || `Added "${login}" to ${r.name}.`, "ok");
+                        await refreshExplorer();
+                    },
+                },
+            ]);
+        });
+    }
 }
 
 // Rebuilds the explorer while preserving expanded nodes and the selected database. Called
@@ -174,10 +491,37 @@ function makeDatabaseNode(name) {
     li.appendChild(node);
     li.appendChild(children);
 
+    attachContextMenu(node, () => [
+        {
+            label: "Grant read-only access to login…",
+            action: () => grantDatabaseAccess(name, "readonly"),
+        },
+        {
+            label: "Grant read/write access to login…",
+            action: () => grantDatabaseAccess(name, "readwrite"),
+        },
+    ]);
+
     // Re-expand automatically if this database was open before a refresh.
     if (expandedDbs.has(name)) { expand(); }
 
     return li;
+}
+
+// Prompts for a login and grants it read-only or read/write access to one database
+// via POST /api/databases/{db}/access, then refreshes the explorer.
+async function grantDatabaseAccess(database, level) {
+    const login = (prompt(
+        `Grant ${level === "readwrite" ? "read/write" : "read-only"} access on "${database}" to which login?`) || "").trim();
+    if (!login) return;
+    try {
+        const res = await sendJson(
+            `/api/databases/${encodeURIComponent(database)}/access`, "POST", { login, level });
+        setStatus(res.message || `Granted ${level} access on ${database} to ${login}.`, "ok");
+        await refreshExplorer();
+    } catch (err) {
+        setStatus(err.message || `Failed to grant access on ${database}.`, "error");
+    }
 }
 
 // Builds a collapsible "folder" node (e.g. Tables, Stored Procedures) and returns the <ul>
@@ -324,8 +668,17 @@ function overviewSection(tab, info) {
     summary.appendChild(summaryCell("Rows", info.rowCount.toLocaleString()));
     summary.appendChild(summaryCell("Columns", String(info.columnCount)));
     summary.appendChild(summaryCell("Size (on disk)", formatBytes(info.sizeBytes)));
-    summary.appendChild(summaryCell("Last modified", formatDate(info.lastModified)));
+    summary.appendChild(summaryCell(
+        "Storage",
+        info.isMultiPart ? `Multi-part (${info.partCount} parts)` : "Single file"));
+    summary.appendChild(summaryCell("Created", formatDateOrNever(info.createdAt)));
+    summary.appendChild(summaryCell("Last data change", formatDateOrNever(info.lastDataChange)));
+    summary.appendChild(summaryCell("Last schema change", formatDateOrNever(info.lastSchemaChange, "—")));
+    summary.appendChild(summaryCell("Last query run", formatDateOrNever(info.lastQueryRun, "Never")));
     wrap.appendChild(summary);
+
+    wrap.appendChild(heading("Security and permissions"));
+    wrap.appendChild(permissionsSection(info.permissions || []));
 
     wrap.appendChild(heading("Quick actions"));
     const actions = document.createElement("div");
@@ -670,6 +1023,49 @@ function heading(text) {
     return h;
 }
 
+// Renders the table's GRANT/DENY permissions (table-, schema-, and database-scoped) as a grid.
+function permissionsSection(perms) {
+    const card = document.createElement("div");
+    card.className = "columns-card";
+
+    if (!perms.length) {
+        card.innerHTML = '<div class="empty">No explicit permissions. Only sysadmins and the db_owner role can access this table until access is granted.</div>';
+        return card;
+    }
+
+    const table = document.createElement("table");
+    table.className = "grid";
+    const htr = document.createElement("tr");
+    for (const h of ["Grantee", "Permission", "Access", "Scope"]) htr.appendChild(th(h));
+    const thd = document.createElement("thead");
+    thd.appendChild(htr);
+    table.appendChild(thd);
+
+    const tbody = document.createElement("tbody");
+    for (const p of perms) {
+        const tr = document.createElement("tr");
+        tr.appendChild(td(p.grantee));
+        tr.appendChild(td(p.permission));
+
+        const access = td("");
+        const badge = document.createElement("span");
+        badge.className = p.state === "DENY" ? "perm-deny" : "perm-grant";
+        badge.textContent = p.state;
+        access.appendChild(badge);
+        tr.appendChild(access);
+
+        tr.appendChild(td(p.scope));
+        tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+
+    const wrap = document.createElement("div");
+    wrap.className = "grid-wrap";
+    wrap.appendChild(table);
+    card.appendChild(wrap);
+    return card;
+}
+
 function summaryCell(label, value) {
     const c = document.createElement("div");
     c.className = "summary-cell";
@@ -716,12 +1112,18 @@ function formatDate(iso) {
     return d.toLocaleString();
 }
 
+// Like formatDate but renders a friendly placeholder when the timestamp is missing (null).
+function formatDateOrNever(iso, placeholder) {
+    if (iso === null || iso === undefined) return placeholder || "—";
+    return formatDate(iso);
+}
+
 function copyText(text) {
     if (navigator.clipboard) navigator.clipboard.writeText(text);
 }
 
-async function fetchJson(url) {
-    const res = await fetch(url);
+async function fetchJson(url, options) {
+    const res = await fetch(url, options);
     if (res.status === 401) {
         showLogin();
         throw new Error("Not authenticated.");
@@ -732,6 +1134,17 @@ async function fetchJson(url) {
         throw new Error(msg);
     }
     return res.json();
+}
+
+// POSTs/DELETEs JSON to a mutating endpoint and returns the parsed body. Reuses fetchJson's 401 and
+// error-message handling.
+function sendJson(url, method, body) {
+    const options = { method };
+    if (body !== undefined) {
+        options.headers = { "Content-Type": "application/json" };
+        options.body = JSON.stringify(body);
+    }
+    return fetchJson(url, options);
 }
 
 function escapeHtml(s) {
@@ -871,6 +1284,56 @@ loginForm.addEventListener("submit", async (e) => {
 $("logoutBtn").addEventListener("click", async () => {
     try { await fetch("/api/logout", { method: "POST" }); } catch {}
     showLogin();
+});
+
+// ---- new-login modal -----------------------------------------------------------
+const newLoginModal = $("newLoginModal");
+const newLoginForm = $("newLoginForm");
+const newLoginUser = $("newLoginUser");
+const newLoginPass = $("newLoginPass");
+const newLoginError = $("newLoginError");
+
+function openNewLoginModal() {
+    newLoginError.textContent = "";
+    newLoginUser.value = "";
+    newLoginPass.value = "";
+    newLoginModal.style.display = "flex";
+    setTimeout(() => newLoginUser.focus(), 0);
+}
+
+function closeNewLoginModal() {
+    newLoginModal.style.display = "none";
+}
+
+$("newLoginCancel").addEventListener("click", closeNewLoginModal);
+// Dismiss when clicking the backdrop (but not the card) or pressing Escape.
+newLoginModal.addEventListener("mousedown", (e) => {
+    if (e.target === newLoginModal) closeNewLoginModal();
+});
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && newLoginModal.style.display === "flex") closeNewLoginModal();
+});
+
+newLoginForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    newLoginError.textContent = "";
+    const name = newLoginUser.value.trim();
+    const password = newLoginPass.value;
+    if (!name) { newLoginError.textContent = "A login name is required."; return; }
+    if (!password) { newLoginError.textContent = "A password is required."; return; }
+
+    const btn = $("newLoginSubmit");
+    btn.disabled = true;
+    try {
+        const res = await sendJson("/api/server/logins", "POST", { login: name, password });
+        closeNewLoginModal();
+        setStatus(res.message || `Login "${name}" created.`, "ok");
+        await refreshExplorer();
+    } catch (err) {
+        newLoginError.textContent = err.message || "Failed to create login.";
+    } finally {
+        btn.disabled = false;
+    }
 });
 
 // ---- my access (effective permissions) -----------------------------------------

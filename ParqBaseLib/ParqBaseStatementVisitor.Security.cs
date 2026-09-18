@@ -46,6 +46,55 @@ namespace ParqBaseLib
             }
         }
 
+        public override void ExplicitVisit(DropLoginStatement node)
+        {
+            try
+            {
+                this.AuthorizeManageServerSecurity();
+
+                var name = node.Name.Value;
+
+                // Guard against locking yourself out: a session may not drop the login it is
+                // currently authenticated as.
+                if (string.Equals(name, this.session.CurrentLogin, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new Exception("A session cannot drop the login it is currently signed in as.");
+                }
+
+                var catalog = new SecurityCatalog(SystemRoot(), null);
+                if (!catalog.LoginExists(name))
+                {
+                    if (node.IsIfExists)
+                    {
+                        this.LastResult.Message = $"Login '{name}' does not exist.";
+                        return;
+                    }
+
+                    throw new Exception($"Login '{name}' does not exist.");
+                }
+
+                // Refuse to remove the last remaining sysadmin, which would leave the server with no
+                // administrator.
+                if (catalog.IsServerRoleMember("sysadmin", name))
+                {
+                    var otherSysadmins = catalog.GetServerRoleMembers()
+                        .Where(m => string.Equals(m.Role, "sysadmin", StringComparison.OrdinalIgnoreCase))
+                        .Any(m => !string.Equals(m.Member, name, StringComparison.OrdinalIgnoreCase));
+                    if (!otherSysadmins)
+                    {
+                        throw new Exception("Cannot drop the last sysadmin login.");
+                    }
+                }
+
+                catalog.RemoveLogin(name);
+                this.LastResult.Message = $"Login '{name}' dropped.";
+            }
+            catch (Exception ex)
+            {
+                this.Fail(ex);
+            }
+        }
+
         // ---- Authentication: database users ------------------------------------
 
         public override void Visit(CreateUserStatement node)

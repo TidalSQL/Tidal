@@ -390,10 +390,12 @@ table.grid td.rownum { color: var(--muted); background: var(--grid-head); text-a
 
 .summary-card {
     display: inline-flex;
+    flex-wrap: wrap;
     gap: 0;
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
+    max-width: 100%;
 }
 
 .summary-cell {
@@ -404,7 +406,17 @@ table.grid td.rownum { color: var(--muted); background: var(--grid-head); text-a
 
 .summary-cell:last-child { border-right: none; }
 .summary-cell .s-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-.summary-cell .s-value { font-size: 20px; font-weight: 600; }
+.summary-cell .s-value { font-size: 16px; font-weight: 600; }
+
+.perm-grant, .perm-deny {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.perm-grant { background: rgba(46, 160, 67, 0.18); color: #2ea043; }
+.perm-deny { background: rgba(248, 81, 73, 0.18); color: #f85149; }
 
 .actions-card {
     display: flex;
@@ -626,3 +638,59 @@ table.grid td.rownum { color: var(--muted); background: var(--grid-head); text-a
 
 .access-table tr.deny td { color: #a4262c; }
 .access-table tr.grant td { color: #107c41; }
+
+/* ---- explorer context menu -------------------------------------------------- */
+.node.has-ctx { cursor: default; }
+
+.ctx-menu {
+    position: fixed;
+    z-index: 2000;
+    min-width: 180px;
+    background: var(--panel);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+    padding: 4px;
+    font-size: 13px;
+    user-select: none;
+}
+
+.ctx-item {
+    padding: 6px 12px;
+    border-radius: 4px;
+    color: var(--text);
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.ctx-item:hover { background: var(--bg); }
+
+.ctx-item.danger { color: #a4262c; }
+
+.ctx-item.danger:hover { background: #fdf3f4; }
+
+/* ---- new-login modal actions ------------------------------------------------ */
+.modal-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.modal-actions .login-btn { flex: 1; }
+
+.login-btn.secondary {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border-strong);
+}
+
+.login-btn.secondary:hover { background: var(--bg); }
+
+/* ---- explorer multi-selection ----------------------------------------------- */
+.node.selected {
+    background: #cfe9e3;
+}
+
+.node.selected:hover {
+    background: #bfe2da;
+}

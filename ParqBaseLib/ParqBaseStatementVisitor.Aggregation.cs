@@ -63,6 +63,8 @@ namespace ParqBaseLib
                     return ContainsAggregate(bin.FirstExpression) || ContainsAggregate(bin.SecondExpression);
                 case ParenthesisExpression paren:
                     return ContainsAggregate(paren.Expression);
+                case UnaryExpression unary:
+                    return ContainsAggregate(unary.Expression);
                 case CastCall cast:
                     return ContainsAggregate(cast.Parameter);
                 case ConvertCall conv:
@@ -127,13 +129,15 @@ namespace ParqBaseLib
             }
 
             var resultRows = new List<object?[]>();
-            if (querySpec.HavingClause != null)
-            {
-                throw new NotSupportedException("HAVING is not supported.");
-            }
 
             foreach (var (sample, groupRows) in groups)
             {
+                if (querySpec.HavingClause != null &&
+                    !this.HavingSatisfied(querySpec.HavingClause.SearchCondition, schema, groupRows, sample, outer))
+                {
+                    continue;
+                }
+
                 var values = new object?[querySpec.SelectElements.Count];
                 for (var i = 0; i < querySpec.SelectElements.Count; i++)
                 {
@@ -147,11 +151,96 @@ namespace ParqBaseLib
             return new RowSet(projSchema, resultRows);
         }
 
+        // Evaluates a HAVING search condition for one group. Comparison operands are evaluated with
+        // aggregate semantics (SUM/COUNT/... over the group, or a group column via the sample row),
+        // mirroring EvaluateBoolean's structure for the connectives TPC-H uses.
+        private bool HavingSatisfied(
+            BooleanExpression expr, List<ColumnRef> schema, List<object?[]> groupRows, object?[]? sample, Env? outer)
+        {
+            switch (expr)
+            {
+                case BooleanParenthesisExpression p:
+                    return this.HavingSatisfied(p.Expression, schema, groupRows, sample, outer);
+
+                case BooleanBinaryExpression b:
+                {
+                    var left = this.HavingSatisfied(b.FirstExpression, schema, groupRows, sample, outer);
+                    return b.BinaryExpressionType == BooleanBinaryExpressionType.And
+                        ? left && this.HavingSatisfied(b.SecondExpression, schema, groupRows, sample, outer)
+                        : left || this.HavingSatisfied(b.SecondExpression, schema, groupRows, sample, outer);
+                }
+
+                case BooleanNotExpression n:
+                    return !this.HavingSatisfied(n.Expression, schema, groupRows, sample, outer);
+
+                case BooleanComparisonExpression cmp:
+                {
+                    var a = this.EvaluateAggregateExpression(cmp.FirstExpression, schema, groupRows, sample, outer);
+                    var b = this.EvaluateAggregateExpression(cmp.SecondExpression, schema, groupRows, sample, outer);
+                    if (a == null || b == null)
+                    {
+                        return false;
+                    }
+
+                    return ApplyOperator(CompareTyped(a, b), cmp.ComparisonType);
+                }
+
+                case BooleanTernaryExpression t:
+                {
+                    var v = this.EvaluateAggregateExpression(t.FirstExpression, schema, groupRows, sample, outer);
+                    var lo = this.EvaluateAggregateExpression(t.SecondExpression, schema, groupRows, sample, outer);
+                    var hi = this.EvaluateAggregateExpression(t.ThirdExpression, schema, groupRows, sample, outer);
+                    var between = v != null && lo != null && hi != null &&
+                        CompareTyped(v, lo) >= 0 && CompareTyped(v, hi) <= 0;
+                    return t.TernaryExpressionType == BooleanTernaryExpressionType.NotBetween ? !between : between;
+                }
+
+                case BooleanIsNullExpression isNull:
+                {
+                    var v = this.EvaluateAggregateExpression(isNull.Expression, schema, groupRows, sample, outer);
+                    return isNull.IsNot ? v != null : v == null;
+                }
+
+                default:
+                    throw new NotSupportedException($"Unsupported HAVING expression: {expr.GetType().Name}");
+            }
+        }
+
         private object? EvaluateAggregateExpression(ScalarExpression expr, List<ColumnRef> schema, List<object?[]> groupRows, object?[]? sample, Env? outer)
         {
             if (expr is FunctionCall fn && fn.OverClause == null && AggregateFunctions.Contains(fn.FunctionName.Value))
             {
                 return this.ComputeAggregate(fn, schema, groupRows, outer);
+            }
+
+            // Compound expressions that contain aggregates must be combined at the group level, e.g.
+            // SUM(x) / SUM(y) or 100.0 * SUM(...). Recurse structurally; leaves without aggregates fall
+            // through to the sample-row evaluation below.
+            if (ContainsAggregate(expr))
+            {
+                switch (expr)
+                {
+                    case ParenthesisExpression paren:
+                        return this.EvaluateAggregateExpression(paren.Expression, schema, groupRows, sample, outer);
+
+                    case UnaryExpression unary:
+                    {
+                        var v = this.EvaluateAggregateExpression(unary.Expression, schema, groupRows, sample, outer);
+                        if (unary.UnaryExpressionType == UnaryExpressionType.Negative && v != null)
+                        {
+                            return ApplyBinaryValues(0, v, BinaryExpressionType.Subtract);
+                        }
+
+                        return v;
+                    }
+
+                    case BinaryExpression binary:
+                    {
+                        var l = this.EvaluateAggregateExpression(binary.FirstExpression, schema, groupRows, sample, outer);
+                        var r = this.EvaluateAggregateExpression(binary.SecondExpression, schema, groupRows, sample, outer);
+                        return ApplyBinaryValues(l, r, binary.BinaryExpressionType);
+                    }
+                }
             }
 
             // Non-aggregate expression: evaluate against a representative (sample) row.

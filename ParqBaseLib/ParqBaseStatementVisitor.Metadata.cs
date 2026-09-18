@@ -67,6 +67,9 @@ namespace ParqBaseLib
 
         private static string MetaFilePath(string tableFilePath) => tableFilePath + ".meta.json";
 
+        /// <summary>Public-facade accessor for a table's metadata sidecar path (schema-change tracking).</summary>
+        internal static string MetaSidecarPath(string tableFilePath) => MetaFilePath(tableFilePath);
+
         /// <summary>Loads the sidecar metadata for a table, or null when none exists (legacy table).</summary>
         private static TableMeta? LoadMeta(string tableFilePath)
         {

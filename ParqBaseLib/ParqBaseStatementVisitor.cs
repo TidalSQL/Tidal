@@ -9,6 +9,7 @@
     using System.Globalization;
     using System.IO;
     using System.Linq;
+    using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
 
@@ -387,9 +388,18 @@
             }
 
             var source = this.EvaluateTableReference(querySpec.FromClause.TableReferences[0], outer, pushLimit);
-            for (var i = 1; i < querySpec.FromClause.TableReferences.Count; i++)
+            if (querySpec.FromClause.TableReferences.Count > 1)
             {
-                source = this.LimitedCrossJoin(source, this.EvaluateTableReference(querySpec.FromClause.TableReferences[i], outer, pushLimit), pushLimit);
+                // Implicit inner joins (comma-separated FROM): combine with predicate pushdown + hash
+                // equi-joins instead of a full cartesian product. The WHERE clause below still runs in
+                // full, so this only changes performance, not results.
+                var bases = new List<RowSet> { source };
+                for (var i = 1; i < querySpec.FromClause.TableReferences.Count; i++)
+                {
+                    bases.Add(this.EvaluateTableReference(querySpec.FromClause.TableReferences[i], outer, null));
+                }
+
+                source = this.BuildImplicitJoin(bases, querySpec.WhereClause?.SearchCondition, outer);
             }
 
             // WHERE
@@ -405,7 +415,8 @@
 
             if (hasAggregate)
             {
-                return this.EvaluateAggregate(querySpec, source.Schema, filtered, outer);
+                var aggregated = this.EvaluateAggregate(querySpec, source.Schema, filtered, outer);
+                return this.OrderAndLimit(aggregated, querySpec, outer);
             }
 
             // ORDER BY (resolved against the source rows, before projection). Order keys are
@@ -531,6 +542,54 @@
             return new RowSet(projSchema, projRows);
         }
 
+        // Applies ORDER BY and TOP to an already-materialized RowSet, resolving order keys against the
+        // RowSet's own schema (used for aggregate/GROUP BY results, whose order keys are output columns).
+        private RowSet OrderAndLimit(RowSet rs, QuerySpecification querySpec, Env? outer)
+        {
+            var rows = rs.Rows;
+
+            if (querySpec.OrderByClause != null && rows.Count > 1)
+            {
+                var elems = querySpec.OrderByClause.OrderByElements;
+                var keyed = rows
+                    .Select(row =>
+                    {
+                        var env = new Env(rs.Schema, row, outer);
+                        return (Row: row, Keys: elems.Select(oe => this.GetScalarValue(oe.Expression, env)).ToArray());
+                    })
+                    .ToList();
+
+                keyed.Sort((a, b) =>
+                {
+                    for (var k = 0; k < elems.Count; k++)
+                    {
+                        var cmp = CompareForOrder(a.Keys[k], b.Keys[k]);
+                        if (elems[k].SortOrder == SortOrder.Descending)
+                        {
+                            cmp = -cmp;
+                        }
+
+                        if (cmp != 0)
+                        {
+                            return cmp;
+                        }
+                    }
+
+                    return 0;
+                });
+
+                rows = keyed.Select(x => x.Row).ToList();
+            }
+
+            var topN = this.GetTopCount(querySpec.TopRowFilter);
+            if (topN.HasValue && rows.Count > topN.Value)
+            {
+                rows = rows.Take(topN.Value).ToList();
+            }
+
+            return new RowSet(rs.Schema, rows);
+        }
+
         /// <summary>Evaluates a TOP (n) clause to a constant row count, unwrapping parentheses. Ignores TOP PERCENT.</summary>
         private int? GetTopCount(TopRowFilter? top)
         {
@@ -610,6 +669,8 @@
                     {
                         throw new Exception($"Table [{tableName}] does not exist.");
                     }
+
+                    TableAccessStats.RecordQuery(this.RequireDatabasePath(), schemaName, tableName);
 
                     TableData table;
                     using (TableLock.Read(source.LockKey))
@@ -1100,9 +1161,102 @@
                     return this.EvaluateQueryExpression(exists.Subquery.QueryExpression, env).Rows.Count > 0;
                 }
 
+                case BooleanNotExpression not:
+                    return !this.EvaluateBoolean(not.Expression, env);
+
+                case BooleanTernaryExpression ternary:
+                {
+                    // BETWEEN / NOT BETWEEN: value >= lower AND value <= upper.
+                    var value = this.GetScalarValue(ternary.FirstExpression, env);
+                    var lower = this.GetScalarValue(ternary.SecondExpression, env);
+                    var upper = this.GetScalarValue(ternary.ThirdExpression, env);
+                    bool between;
+                    if (value == null || lower == null || upper == null)
+                    {
+                        between = false;
+                    }
+                    else
+                    {
+                        between = CompareTyped(value, lower) >= 0 && CompareTyped(value, upper) <= 0;
+                    }
+
+                    return ternary.TernaryExpressionType == BooleanTernaryExpressionType.NotBetween
+                        ? !between
+                        : between;
+                }
+
+                case LikePredicate like:
+                {
+                    var value = this.GetScalarValue(like.FirstExpression, env);
+                    var pattern = this.GetScalarValue(like.SecondExpression, env);
+                    if (value == null || pattern == null)
+                    {
+                        return false;
+                    }
+
+                    var escape = like.EscapeExpression != null
+                        ? Stringify(this.GetScalarValue(like.EscapeExpression, env))
+                        : null;
+                    var matched = LikeMatch(Stringify(value), Stringify(pattern), escape);
+                    return like.NotDefined ? !matched : matched;
+                }
+
                 default:
                     throw new NotSupportedException($"Unsupported WHERE expression: {expr.GetType().Name}");
             }
+        }
+
+        // Translates a SQL LIKE pattern (with % and _ wildcards and an optional ESCAPE char) into an
+        // anchored, case-sensitive regex. Compiled regexes are cached because the same pattern is
+        // typically evaluated against millions of rows.
+        private static readonly Dictionary<string, Regex> LikeRegexCache = new();
+
+        private static bool LikeMatch(string value, string pattern, string? escape)
+        {
+            var escapeChar = !string.IsNullOrEmpty(escape) ? escape[0] : (char?)null;
+            var cacheKey = (escapeChar ?? '\0') + "\u0001" + pattern;
+            Regex regex;
+            lock (LikeRegexCache)
+            {
+                if (!LikeRegexCache.TryGetValue(cacheKey, out regex!))
+                {
+                    regex = new Regex(LikeToRegex(pattern, escapeChar), RegexOptions.Singleline | RegexOptions.CultureInvariant);
+                    LikeRegexCache[cacheKey] = regex;
+                }
+            }
+
+            return regex.IsMatch(value);
+        }
+
+        private static string LikeToRegex(string pattern, char? escape)
+        {
+            var sb = new System.Text.StringBuilder(pattern.Length + 8);
+            sb.Append('^');
+            for (var i = 0; i < pattern.Length; i++)
+            {
+                var c = pattern[i];
+                if (escape.HasValue && c == escape.Value && i + 1 < pattern.Length)
+                {
+                    sb.Append(Regex.Escape(pattern[++i].ToString()));
+                    continue;
+                }
+
+                switch (c)
+                {
+                    case '%':
+                        sb.Append(".*");
+                        break;
+                    case '_':
+                        sb.Append('.');
+                        break;
+                    default:
+                        sb.Append(Regex.Escape(c.ToString()));
+                        break;
+                }
+            }
+
+            sb.Append('$');
+            return sb.ToString();
         }
 
         private List<object?> EvaluateSubqueryColumn(ScalarSubquery subquery, Env outer)

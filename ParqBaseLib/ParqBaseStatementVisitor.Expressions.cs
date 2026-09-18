@@ -19,14 +19,20 @@ namespace ParqBaseLib
         {
             var left = this.GetScalarValue(binary.FirstExpression, env);
             var right = this.GetScalarValue(binary.SecondExpression, env);
+            return ApplyBinaryValues(left, right, binary.BinaryExpressionType);
+        }
+
+        // Value-level arithmetic (and '+' string concat). Shared by scalar evaluation and by
+        // aggregate-expression evaluation (e.g. SUM(x) / SUM(y), 100.0 * SUM(...)).
+        private static object? ApplyBinaryValues(object? left, object? right, BinaryExpressionType op)
+        {
             if (left == null || right == null)
             {
                 return null;
             }
 
             // '+' doubles as string concatenation when either side is text.
-            if (binary.BinaryExpressionType == BinaryExpressionType.Add &&
-                (left is string || right is string))
+            if (op == BinaryExpressionType.Add && (left is string || right is string))
             {
                 return Stringify(left) + Stringify(right);
             }
@@ -41,27 +47,27 @@ namespace ParqBaseLib
             {
                 var a = (int)left;
                 var b = (int)right;
-                return binary.BinaryExpressionType switch
+                return op switch
                 {
                     BinaryExpressionType.Add => (object)(a + b),
                     BinaryExpressionType.Subtract => a - b,
                     BinaryExpressionType.Multiply => a * b,
                     BinaryExpressionType.Divide => b == 0 ? throw new DivideByZeroException() : a / b,
                     BinaryExpressionType.Modulo => b == 0 ? throw new DivideByZeroException() : a % b,
-                    _ => throw new NotSupportedException($"Unsupported operator: {binary.BinaryExpressionType}"),
+                    _ => throw new NotSupportedException($"Unsupported operator: {op}"),
                 };
             }
 
             var da = ToDecimal(left);
             var db = ToDecimal(right);
-            return binary.BinaryExpressionType switch
+            return op switch
             {
                 BinaryExpressionType.Add => (object)(da + db),
                 BinaryExpressionType.Subtract => da - db,
                 BinaryExpressionType.Multiply => da * db,
                 BinaryExpressionType.Divide => db == 0 ? throw new DivideByZeroException() : da / db,
                 BinaryExpressionType.Modulo => db == 0 ? throw new DivideByZeroException() : da % db,
-                _ => throw new NotSupportedException($"Unsupported operator: {binary.BinaryExpressionType}"),
+                _ => throw new NotSupportedException($"Unsupported operator: {op}"),
             };
         }
 

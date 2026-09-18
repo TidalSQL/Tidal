@@ -52,6 +52,15 @@ namespace ParqBaseTests
             Assert.AreEqual(4, info.ColumnCount);
             Assert.IsTrue(info.SizeBytes > 0);
 
+            // Detailed summary facts.
+            Assert.IsFalse(info.IsMultiPart);
+            Assert.AreEqual(1, info.PartCount);
+            Assert.IsTrue(info.CreatedAt > DateTime.MinValue);
+            Assert.IsTrue(info.LastDataChange >= info.CreatedAt);
+            Assert.IsNotNull(info.LastSchemaChange, "A CREATE TABLE table should have a schema-change timestamp.");
+            Assert.IsNull(info.LastQueryRun, "No query has read the table yet.");
+            Assert.AreEqual(0, info.Permissions.Count, "No explicit grants were made.");
+
             var id = info.Columns[0];
             Assert.AreEqual("Id", id.Name);
             Assert.AreEqual("int", id.DataType);
@@ -86,6 +95,37 @@ namespace ParqBaseTests
             this.dbPath = session.CurrentDatabasePath!;
 
             Assert.ThrowsException<Exception>(() => session.GetTableInfo(this.dbName, "NoSuchTable"));
+        }
+
+        [TestMethod]
+        public void GetTableInfo_SurfacesPermissionsAndLastQueryRun()
+        {
+            var session = new ParqBase();
+            Assert.IsTrue(session.ExecuteQuery($"create database {this.dbName}").Success);
+            Assert.IsTrue(session.ExecuteQuery($"use {this.dbName}").Success);
+            this.dbPath = session.CurrentDatabasePath!;
+
+            Assert.IsTrue(session.ExecuteQuery("CREATE TABLE dbo.Orders (Id INT NOT NULL);").Success);
+            Assert.IsTrue(session.ExecuteQuery("INSERT INTO Orders (Id) VALUES (1), (2), (3);").Success);
+
+            // Grant a table-scoped permission to a role and verify it is surfaced.
+            Assert.IsTrue(session.ExecuteQuery("CREATE ROLE Analysts;").Success);
+            Assert.IsTrue(session.ExecuteQuery("GRANT SELECT ON Orders TO Analysts;").Success);
+
+            // Before any read the last-query time is unset.
+            var before = session.GetTableInfo(this.dbName, "Orders");
+            Assert.IsNull(before.LastQueryRun);
+            var grant = before.Permissions.Single(p =>
+                p.Grantee == "Analysts" && p.Permission == "SELECT");
+            Assert.AreEqual("GRANT", grant.State);
+            Assert.AreEqual("Table", grant.Scope);
+
+            // Running a query against the table records a last-query-run timestamp.
+            Assert.IsTrue(session.ExecuteQuery("SELECT COUNT(*) AS C FROM Orders;").Success);
+            var after = session.GetTableInfo(this.dbName, "Orders");
+            Assert.IsNotNull(after.LastQueryRun, "A SELECT should stamp the last-query-run time.");
+            Assert.IsTrue(
+                after.LastQueryRun!.Value.ToUniversalTime() >= before.CreatedAt.ToUniversalTime().AddSeconds(-5));
         }
     }
 }
