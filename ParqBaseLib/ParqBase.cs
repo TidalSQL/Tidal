@@ -24,8 +24,9 @@
 
         /// <summary>
         /// Root folder for all persisted data (databases and the server security catalog).
-        /// Resolves to the ParqBaseLib project directory so data survives a clean build of the
-        /// output (bin/obj) folders, and can be overridden with the PARQBASE_DATA_ROOT env var.
+        /// Defaults to <c>%ProgramData%\ParqBase</c> (a machine-wide location outside any user's
+        /// source tree, so it can be ACL-locked to a dedicated service account the same way SQL
+        /// Server protects its data files), and can be overridden with the PARQBASE_DATA_ROOT env var.
         /// </summary>
         internal static string DataRoot { get; } = ResolveDataRoot();
 
@@ -733,10 +734,12 @@
         }
 
         /// <summary>
-        /// Determines the persistent data root. Prefers the PARQBASE_DATA_ROOT environment variable,
-        /// then walks up from the running assembly's location to find the ParqBaseLib project folder
-        /// (the directory containing ParqBaseLib.csproj), and finally falls back to the base directory.
-        /// Keeping data out of bin/obj means it is not deleted by a clean/rebuild.
+        /// Determines the persistent data root. Prefers the PARQBASE_DATA_ROOT environment variable;
+        /// otherwise uses the machine-wide <c>%ProgramData%\ParqBase</c> folder. Keeping data in
+        /// ProgramData (rather than inside a user's source tree) lets an administrator restrict the
+        /// directory's NTFS ACLs to a dedicated ParqBase service account, so interactive users cannot
+        /// read or tamper with the underlying Parquet/system files directly — analogous to how SQL
+        /// Server denies OS-level access to its data files.
         /// </summary>
         private static string ResolveDataRoot()
         {
@@ -747,19 +750,10 @@
                 return Path.GetFullPath(configured);
             }
 
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
-            while (dir != null)
-            {
-                var projectDir = Path.Combine(dir.FullName, "ParqBaseLib");
-                if (File.Exists(Path.Combine(projectDir, "ParqBaseLib.csproj")))
-                {
-                    return projectDir;
-                }
-
-                dir = dir.Parent;
-            }
-
-            return AppContext.BaseDirectory;
+            var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            var root = Path.Combine(programData, "ParqBase");
+            Directory.CreateDirectory(root);
+            return root;
         }
     }
 
