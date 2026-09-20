@@ -60,7 +60,7 @@ namespace ParqBaseTests
 
         private void DeleteOrdersDb()
         {
-            var dbDir = Path.Combine(this.repoRoot, "ParqBaseLib", "databases", "OrdersDB");
+            var dbDir = Path.Combine(ParqBaseLib.ParqBase.DatabasesRoot, "OrdersDB");
             if (Directory.Exists(dbDir))
             {
                 Directory.Delete(dbDir, true);

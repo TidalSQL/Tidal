@@ -675,7 +675,9 @@
                     TableData table;
                     using (TableLock.Read(source.LockKey))
                     {
-                        table = this.LoadTableAsync(source.Files).GetAwaiter().GetResult();
+                        table = source.Delta is { IsPartitioned: true }
+                            ? this.LoadDeltaAsync(source.Delta).GetAwaiter().GetResult()
+                            : this.LoadTableAsync(source.Files).GetAwaiter().GetResult();
                     }
 
                     var schema = table.Order.Select(c => new ColumnRef(qualifier, c)).ToList();

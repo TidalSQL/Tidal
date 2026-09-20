@@ -42,6 +42,13 @@ namespace ParqBaseLib
             /// <summary>The canonical single-file path, used by write paths (INSERT/UPDATE/DELETE).</summary>
             public required string SingleFilePath { get; init; }
 
+            /// <summary>
+            /// When non-null, this table is a read-only Delta Lake table; <see cref="Files"/> holds the
+            /// active data files from the transaction-log snapshot and <see cref="Delta"/> carries the
+            /// partition columns/schema needed to project partition values that live only in the log.
+            /// </summary>
+            public DeltaSnapshot? Delta { get; init; }
+
             /// <summary>First data file, used for schema inference. Empty string when the table is absent.</summary>
             public string PrimaryFile => this.Files.Count > 0 ? this.Files[0] : this.SingleFilePath;
         }
@@ -79,6 +86,22 @@ namespace ParqBaseLib
                 if (!Directory.Exists(dir))
                 {
                     continue;
+                }
+
+                // A Delta table is a directory containing a _delta_log; its active file set must come
+                // from the transaction log (not a raw glob, which would include tombstoned files).
+                if (DeltaLog.IsDeltaTable(dir))
+                {
+                    var snapshot = DeltaLog.ReadSnapshot(dir);
+                    return new TableSource
+                    {
+                        Exists = true,
+                        IsMultiPart = true,
+                        Files = snapshot.Files.Select(f => f.AbsolutePath).ToList(),
+                        LockKey = dir,
+                        SingleFilePath = singleFile,
+                        Delta = snapshot,
+                    };
                 }
 
                 var parts = EnumerateParts(dir);
@@ -215,7 +238,7 @@ namespace ParqBaseLib
 
                 foreach (var sub in Directory.GetDirectories(dir))
                 {
-                    if (EnumerateParts(sub).Count == 0)
+                    if (!DeltaLog.IsDeltaTable(sub) && EnumerateParts(sub).Count == 0)
                     {
                         continue;
                     }
@@ -253,6 +276,12 @@ namespace ParqBaseLib
             }
 
             var source = this.ResolveTableSource(schema, table);
+            if (source.Exists && source.Delta != null)
+            {
+                throw new NotSupportedException(
+                    $"Table [{table}] is a read-only Delta Lake table; writes to Delta tables are not supported.");
+            }
+
             if (source.Exists && source.IsMultiPart)
             {
                 throw new NotSupportedException(
