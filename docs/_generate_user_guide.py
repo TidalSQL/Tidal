@@ -1,5 +1,5 @@
 """
-Generates docs/ParqBase-User-Guide.docx.
+Generates docs/TidalSql-User-Guide.docx.
 
 This script is the source of truth for the Word document. Re-run it after editing to
 regenerate the .docx:
@@ -16,7 +16,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "ParqBase-User-Guide.docx")
+OUT = os.path.join(HERE, "TidalSql-User-Guide.docx")
 
 # ---- palette -------------------------------------------------------------------
 INK = RGBColor(0x1B, 0x1F, 0x24)
@@ -120,7 +120,7 @@ normal.font.color.rgb = INK
 
 # ---- Title --------------------------------------------------------------------
 title = doc.add_paragraph()
-tr = title.add_run("ParqBase")
+tr = title.add_run("TidalSql")
 tr.font.size = Pt(34)
 tr.bold = True
 tr.font.color.rgb = ACCENT
@@ -136,7 +136,7 @@ mr.italic = True
 mr.font.color.rgb = MUTED
 
 para(doc,
-     "ParqBase stores each table as one or more Apache Parquet files and lets you query and "
+     "TidalSql stores each table as one or more Apache Parquet files and lets you query and "
      "manage them with a familiar Transact-SQL dialect. It provides a SQL Server\u2013style "
      "security model (logins, users, roles, schemas, and GRANT/DENY/REVOKE), a web-based SQL "
      "editor with an object explorer, and an interactive console (REPL).",
@@ -165,37 +165,37 @@ doc.add_page_break()
 
 # ================================================================================
 doc.add_heading("1. Getting Started", level=1)
-para(doc, "ParqBase ships as a .NET 8 solution with three ways to run it:", after=4)
+para(doc, "TidalSql ships as a .NET 8 solution with three ways to run it:", after=4)
 make_table(doc,
     ["Component", "Project", "What it is"],
     [
-        ["Engine library", "ParqBaseLib", "The T-SQL engine and security model. Referenced by the other apps."],
-        ["Web app", "ParqBaseApi", "A browser SQL editor with a login screen and object explorer."],
-        ["Console (REPL)", "ParqBaseConsole", "An interactive command-line session for running SQL and scripts."],
+        ["Engine library", "TidalSqlLib", "The T-SQL engine and security model. Referenced by the other apps."],
+        ["Web app", "TidalSqlApi", "A browser SQL editor with a login screen and object explorer."],
+        ["Console (REPL)", "TidalSqlConsole", "An interactive command-line session for running SQL and scripts."],
     ],
     widths=[1.7, 1.6, 3.0])
 
 doc.add_heading("Run the console (REPL)", level=2)
-code_block(doc, ["dotnet run --project ParqBaseConsole"])
-para(doc, "On first run, ParqBase seeds a default administrator login and prints its "
+code_block(doc, ["dotnet run --project TidalSqlConsole"])
+para(doc, "On first run, TidalSql seeds a default administrator login and prints its "
           "credentials once. Sign in, then change the password.", after=4)
 make_table(doc,
     ["Setting", "Value"],
     [
         ["Default admin login", "admin"],
-        ["Initial password", "Printed once on first run (or set PARQBASE_ADMIN_PASSWORD)"],
+        ["Initial password", "Printed once on first run (or set TIDALSQL_ADMIN_PASSWORD)"],
     ],
     widths=[2.4, 3.9])
 para(doc, "Useful REPL commands:", after=2)
 bullet(doc, [("Type any T-SQL statement and press Enter to execute it.", False)])
 bullet(doc, [(":r <path>", True), ("  or  ", False), ("run <path>", True),
              ("  \u2014 execute a .sql script file (for example ", False),
-             ("ParqScripts/build.sql", True), (").", False)])
+             ("TidalScripts/build.sql", True), (").", False)])
 bullet(doc, [("exit", True), ("  or  ", False), ("quit", True), ("  \u2014 end the session.", False)])
 
 doc.add_heading("Run the web app", level=2)
 code_block(doc, [
-    "dotnet run --project ParqBaseApi",
+    "dotnet run --project TidalSqlApi",
     "# then open the printed URL, e.g. https://localhost:62549",
 ])
 para(doc, "Sign in with your login on the web page. The left pane is an object explorer "
@@ -205,7 +205,7 @@ para(doc, "Sign in with your login on the web page. The left pane is an object e
 # ================================================================================
 doc.add_heading("2. Core Concepts", level=1)
 make_table(doc,
-    ["Concept", "How ParqBase implements it"],
+    ["Concept", "How TidalSql implements it"],
     [
         ["Database", "A folder on disk. Create with CREATE DATABASE; select with USE."],
         ["Table", "A Parquet file (tables/<name>.parquet) or a directory of part files "
@@ -246,7 +246,7 @@ code_block(doc, [
 
 # ================================================================================
 doc.add_heading("4. Querying Data", level=1)
-para(doc, "ParqBase supports a broad T-SQL surface, including:", after=2)
+para(doc, "TidalSql supports a broad T-SQL surface, including:", after=2)
 for feat in [
     "SELECT with WHERE, GROUP BY, HAVING, ORDER BY, DISTINCT, and TOP (n).",
     "Joins (INNER/LEFT), subqueries, derived tables, and common table expressions (WITH).",
@@ -267,7 +267,7 @@ code_block(doc, [
 # ================================================================================
 doc.add_heading("5. Security: Logins, Users, Roles, and Permissions", level=1)
 para(doc,
-     "ParqBase mirrors SQL Server's authorization model. Authentication happens at the server "
+     "TidalSql mirrors SQL Server's authorization model. Authentication happens at the server "
      "with a login; authorization happens inside a database, where a login is mapped to a user "
      "that is granted permissions directly or through roles.",
      after=6)

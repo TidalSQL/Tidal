@@ -75,7 +75,7 @@ StyleCopReport.xml
 *_h.h
 *.ilk
 *.meta
-# ParqBase best-effort per-table usage statistics (advisory, not source)
+# TidalSql best-effort per-table usage statistics (advisory, not source)
 .access-stats.json
 *.obj
 *.iobj
@@ -363,6 +363,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
-# ParqBase persistent data (databases + server security catalog)
-ParqBaseLib/databases/
-ParqBaseLib/system/
+# TidalSql persistent data (databases + server security catalog)
+TidalSqlLib/databases/
+TidalSqlLib/system/

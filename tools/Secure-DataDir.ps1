@@ -1,25 +1,25 @@
 <#
 .SYNOPSIS
-    Hardens the NTFS ACLs on the ParqBase data directory so that only a dedicated
-    ParqBase service account (plus Administrators and SYSTEM) can read or modify the
+    Hardens the NTFS ACLs on the TidalSql data directory so that only a dedicated
+    TidalSql service account (plus Administrators and SYSTEM) can read or modify the
     underlying Parquet and system files.
 
 .DESCRIPTION
-    ParqBase stores every database as plain Parquet files and its security catalog as
-    JSON under a data root (default: %ProgramData%\ParqBase). By default that folder
+    TidalSql stores every database as plain Parquet files and its security catalog as
+    JSON under a data root (default: %ProgramData%\TidalSql). By default that folder
     inherits permissions that let ordinary interactive users browse and edit those
     files directly from the OS, bypassing the engine's logins, roles and GRANT/DENY
     checks entirely.
 
     This script locks the directory down so the *only* principals with access are:
-      * the dedicated ParqBase service account the engine runs as,
+      * the dedicated TidalSql service account the engine runs as,
       * the local Administrators group (needed for backup/maintenance), and
       * NT AUTHORITY\SYSTEM.
 
     Interactive users must then go through the engine (logins + permissions) to see
     any data — the same trust model SQL Server uses for its data files.
 
-    IMPORTANT (trust boundary): NTFS ACLs are only an effective lock when the ParqBase
+    IMPORTANT (trust boundary): NTFS ACLs are only an effective lock when the TidalSql
     engine runs as a *different* account than the interactive users, and those users
     are NOT local administrators. A local administrator can always take ownership and
     reset ACLs. This is the identical limitation SQL Server has; it is not a bug.
@@ -27,11 +27,11 @@
     The script is idempotent and can be re-run safely after adding new databases.
 
 .PARAMETER Path
-    The ParqBase data root to secure. Defaults to $env:ProgramData\ParqBase.
+    The TidalSql data root to secure. Defaults to $env:ProgramData\TidalSql.
 
 .PARAMETER ServiceAccount
-    The account ParqBase runs as, which must retain full access
-    (e.g. 'MACHINE\ParqBaseSvc', '.\ParqBaseSvc', or 'DOMAIN\svc-parqbase').
+    The account TidalSql runs as, which must retain full access
+    (e.g. 'MACHINE\TidalSqlSvc', '.\TidalSqlSvc', or 'DOMAIN\svc-tidalsql').
     For a Windows Service running under a virtual account, pass
     'NT SERVICE\<ServiceName>'.
 
@@ -40,14 +40,14 @@
 
 .EXAMPLE
     # Run elevated (Administrator):
-    .\Secure-DataDir.ps1 -ServiceAccount '.\ParqBaseSvc'
+    .\Secure-DataDir.ps1 -ServiceAccount '.\TidalSqlSvc'
 
 .EXAMPLE
-    .\Secure-DataDir.ps1 -Path 'D:\ParqBaseData' -ServiceAccount 'NT SERVICE\ParqBase'
+    .\Secure-DataDir.ps1 -Path 'D:\TidalSqlData' -ServiceAccount 'NT SERVICE\TidalSql'
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$Path = (Join-Path $env:ProgramData 'ParqBase'),
+    [string]$Path = (Join-Path $env:ProgramData 'TidalSql'),
 
     [Parameter(Mandatory = $true)]
     [string]$ServiceAccount
@@ -66,7 +66,7 @@ if (-not (Test-Admin)) {
 }
 
 if (-not (Test-Path -LiteralPath $Path)) {
-    throw "Data root '$Path' does not exist. Start ParqBase once (or create the folder) before securing it."
+    throw "Data root '$Path' does not exist. Start TidalSql once (or create the folder) before securing it."
 }
 
 $Path = (Resolve-Path -LiteralPath $Path).Path
@@ -76,10 +76,10 @@ try {
     $null = (New-Object Security.Principal.NTAccount($ServiceAccount)).Translate([Security.Principal.SecurityIdentifier])
 }
 catch {
-    throw "Service account '$ServiceAccount' could not be resolved to a SID. Create the account first, or check the name (e.g. '.\ParqBaseSvc' or 'NT SERVICE\ParqBase')."
+    throw "Service account '$ServiceAccount' could not be resolved to a SID. Create the account first, or check the name (e.g. '.\TidalSqlSvc' or 'NT SERVICE\TidalSql')."
 }
 
-Write-Host "Securing ParqBase data root: $Path" -ForegroundColor Cyan
+Write-Host "Securing TidalSql data root: $Path" -ForegroundColor Cyan
 Write-Host "Granting exclusive access to: $ServiceAccount, Administrators, SYSTEM" -ForegroundColor Cyan
 
 # 1. Take ownership so we can always rewrite the ACL (Administrators).
@@ -132,5 +132,5 @@ if ($PSCmdlet.ShouldProcess($Path, "Apply ACLs recursively")) {
 Write-Host "`nDone. Effective permissions:" -ForegroundColor Green
 & icacls.exe "$Path"
 
-Write-Host "`nReminder: this lock is only enforceable if the ParqBase engine runs as '$ServiceAccount'" -ForegroundColor Yellow
+Write-Host "`nReminder: this lock is only enforceable if the TidalSql engine runs as '$ServiceAccount'" -ForegroundColor Yellow
 Write-Host "and interactive users are NOT local administrators. Local admins can always bypass NTFS ACLs." -ForegroundColor Yellow

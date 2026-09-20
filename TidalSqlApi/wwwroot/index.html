@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TidalSql — SQL editor</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <header class="menubar">
+        <div class="brand">
+            <span class="logo">◆</span>
+            <span>TidalSql</span>
+        </div>
+        <nav class="menu">
+            <span class="menu-item active">Home</span>
+            <span class="menu-item">Security</span>
+            <span class="menu-item">Management</span>
+            <span class="menu-item">Migration</span>
+            <span class="menu-item">Help</span>
+        </nav>
+        <div class="userbox" id="userbox" style="display:none;">
+            <button id="accessBtn" class="user-btn" title="Show my permissions">🔑 My Access</button>
+            <span class="user-chip"><span class="user-icon">👤</span><span id="userName"></span></span>
+            <button id="logoutBtn" class="user-btn">Log out</button>
+        </div>
+    </header>
+
+    <div class="layout">
+        <aside class="explorer">
+            <div class="explorer-head">
+                <span>Explorer</span>
+                <button id="refreshBtn" title="Refresh" class="icon-btn">⟳</button>
+            </div>
+            <ul id="tree" class="tree"></ul>
+        </aside>
+
+        <div id="vResizer" class="resizer resizer-v" title="Drag to resize"></div>
+
+        <main class="workspace">
+            <div id="tabbar" class="tabbar"></div>
+
+            <div id="queryView" class="view">
+                <div class="toolbar">
+                    <button id="runBtn" class="run-btn">▶ Run</button>
+                    <button id="cancelBtn" class="run-btn cancel-btn" style="display:none;">■ Cancel</button>
+                    <span class="toolbar-sep"></span>
+                    <span class="db-label">Database:</span>
+                    <select id="dbSelect" class="db-select">
+                        <option value="">(none)</option>
+                    </select>
+                    <span id="status" class="status"></span>
+                </div>
+
+                <div class="editor-wrap">
+                    <div id="gutter" class="gutter"></div>
+                    <textarea id="editor" class="editor" spellcheck="false"
+                              placeholder="-- Write T-SQL here, then press Run (or Ctrl+Enter)">SELECT name FROM sys.databases;</textarea>
+                </div>
+
+                <div id="hResizer" class="resizer resizer-h" title="Drag to resize"></div>
+
+                <div class="results">
+                    <div class="result-tabs">
+                        <div id="tabResults" class="result-tab active">Results</div>
+                        <div id="tabMessages" class="result-tab">Messages</div>
+                    </div>
+                    <div class="result-body">
+                        <div id="resultsPane" class="pane active">
+                            <div id="gridWrap" class="grid-wrap"></div>
+                        </div>
+                        <div id="messagesPane" class="pane">
+                            <pre id="messages" class="messages"></pre>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="tableView" class="view hidden"></div>
+        </main>
+    </div>
+
+            <!-- Login overlay: shown until a server login is authenticated. -->
+            <div id="loginOverlay" class="overlay">
+                <form id="loginForm" class="login-card" autocomplete="off">
+                    <div class="login-brand"><span class="logo">◆</span> TidalSql</div>
+                    <div class="login-sub">Sign in to continue</div>
+                    <label class="login-label">Login</label>
+                    <input id="loginUser" class="login-input" type="text" autocomplete="username" autofocus />
+                    <label class="login-label">Password</label>
+                    <input id="loginPass" class="login-input" type="password" autocomplete="current-password" />
+                    <div id="loginError" class="login-error"></div>
+                    <button id="loginSubmit" type="submit" class="login-btn">Sign in</button>
+                </form>
+            </div>
+
+            <!-- My Access: the current login's effective T-SQL permissions. -->
+            <div id="accessModal" class="overlay" style="display:none;">
+                <div class="access-card">
+                    <div class="access-head">
+                        <span id="accessTitle">My permissions</span>
+                        <button id="accessClose" class="user-btn">Close</button>
+                    </div>
+                    <div id="accessBody" class="access-body"></div>
+                </div>
+            </div>
+
+            <!-- New login dialog: create a server login (name + password in one dialog). -->
+            <div id="newLoginModal" class="overlay" style="display:none;">
+                <form id="newLoginForm" class="login-card" autocomplete="off">
+                    <div class="login-brand"><span class="logo">◆</span> New login</div>
+                    <div class="login-sub">Create a server login</div>
+                    <label class="login-label">Login name</label>
+                    <input id="newLoginUser" class="login-input" type="text" autocomplete="off" />
+                    <label class="login-label">Password</label>
+                    <input id="newLoginPass" class="login-input" type="password" autocomplete="new-password" />
+                    <div id="newLoginError" class="login-error"></div>
+                    <div class="modal-actions">
+                        <button type="button" id="newLoginCancel" class="login-btn secondary">Cancel</button>
+                        <button type="submit" id="newLoginSubmit" class="login-btn">Create</button>
+                    </div>
+                </form>
+            </div>
+
+            <script src="app.js"></script>
+</body>
+</html>
