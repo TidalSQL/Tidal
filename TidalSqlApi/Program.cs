@@ -383,11 +383,12 @@ app.MapGet("/api/databases/{database}/tables/{table}/stream",
         types = stream.Columns.Select(c => c.Type).ToList(),
         totalRows = stream.TotalRows,
     });
-    await http.Response.WriteAsync(header + "\n", ct);
-    await http.Response.Body.FlushAsync(ct);
 
     try
     {
+        await http.Response.WriteAsync(header + "\n", ct);
+        await http.Response.Body.FlushAsync(ct);
+
         await foreach (var batch in stream.Batches.WithCancellation(ct))
         {
             var line = JsonSerializer.Serialize(new { start = batch.StartIndex, rows = batch.Rows });
@@ -398,6 +399,11 @@ app.MapGet("/api/databases/{database}/tables/{table}/stream",
     catch (OperationCanceledException)
     {
         // Client navigated away / cancelled the stream; nothing more to send.
+    }
+    finally
+    {
+        // Release the pinned file snapshot even if we never reached (or fully drained) the stream.
+        stream.Dispose();
     }
 });
 

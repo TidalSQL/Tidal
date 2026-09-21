@@ -22,14 +22,135 @@ namespace TidalSqlLib
     /// A lazily-streamed table read. <see cref="Columns"/> and <see cref="TotalRows"/> are known up
     /// front (from the Parquet footer); <see cref="Batches"/> yields rows a row group at a time so a
     /// consumer never has to hold the whole table in memory.
+    ///
+    /// <para>The result pins a consistent snapshot of the underlying Parquet file(s) at open time, so
+    /// <see cref="TotalRows"/> and every streamed row come from the same version even if a writer
+    /// atomically swaps the table in mid-read. The pinned file handles are released when the
+    /// <see cref="Batches"/> enumeration completes (or is cancelled); callers that read the metadata
+    /// but never enumerate should <see cref="Dispose"/> the result to release them.</para>
     /// </summary>
-    public sealed class TableStreamResult
+    public sealed class TableStreamResult : IDisposable
     {
         public required IReadOnlyList<TableStreamColumn> Columns { get; init; }
 
         public required long TotalRows { get; init; }
 
         public required IAsyncEnumerable<TableRowBatch> Batches { get; init; }
+
+        /// <summary>The pinned file snapshot backing this read; disposed with the result (idempotent).</summary>
+        internal IDisposable? Snapshot { get; init; }
+
+        public void Dispose() => this.Snapshot?.Dispose();
+    }
+
+    /// <summary>
+    /// A pinned, point-in-time snapshot of a (possibly multi-part) table's Parquet files. The files are
+    /// opened once — under a shared read lock, with <see cref="FileShare.Delete"/> so a writer's atomic
+    /// <c>File.Move</c> swap still succeeds — and the open handles keep serving the original bytes even
+    /// after the on-disk file is replaced. Both the row count and the streamed rows are derived from
+    /// these same handles, giving true snapshot isolation without holding the table lock for the whole
+    /// (consumer-paced) drain. Disposal is idempotent and safe to call from the enumerator and the
+    /// owning <see cref="TableStreamResult"/>.
+    /// </summary>
+    internal sealed class PinnedTableSnapshot : IDisposable
+    {
+        private readonly List<Stream> streams;
+        private int disposed;
+
+        private PinnedTableSnapshot(
+            List<Stream> streams,
+            List<ParquetReader> readers,
+            List<TableStreamColumn> columns,
+            long totalRows)
+        {
+            this.streams = streams;
+            this.Readers = readers;
+            this.Columns = columns;
+            this.TotalRows = totalRows;
+        }
+
+        public IReadOnlyList<ParquetReader> Readers { get; }
+
+        public IReadOnlyList<TableStreamColumn> Columns { get; }
+
+        public long TotalRows { get; }
+
+        /// <summary>
+        /// Opens and pins every part of a table under a single read lock, resolving its columns and
+        /// total row count from the pinned handles so they can never disagree with what is streamed.
+        /// </summary>
+        public static PinnedTableSnapshot Open(string lockKey, IReadOnlyList<string> files)
+        {
+            var streams = new List<Stream>();
+            var readers = new List<ParquetReader>();
+            try
+            {
+                // Open all parts under one read lock so we capture a single, non-torn version. Sharing
+                // Delete lets a concurrent writer replace the file on disk while our handle keeps the
+                // original bytes alive for the life of this snapshot.
+                using (TableLock.Read(lockKey))
+                {
+                    foreach (var filePath in files)
+                    {
+                        var stream = new FileStream(
+                            filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
+                        streams.Add(stream);
+                        readers.Add(ParquetReader.CreateAsync(stream, leaveStreamOpen: true).GetAwaiter().GetResult());
+                    }
+                }
+
+                var columns = new List<TableStreamColumn>();
+                foreach (var field in readers[0].Schema.DataFields)
+                {
+                    columns.Add(new TableStreamColumn(
+                        field.Name, TidalSqlStatementVisitor.MapClrTypeName(field.ClrType)));
+                }
+
+                long totalRows = 0;
+                foreach (var reader in readers)
+                {
+                    for (var g = 0; g < reader.RowGroupCount; g++)
+                    {
+                        using var groupReader = reader.OpenRowGroupReader(g);
+                        totalRows += groupReader.RowCount;
+                    }
+                }
+
+                return new PinnedTableSnapshot(streams, readers, columns, totalRows);
+            }
+            catch
+            {
+                foreach (var reader in readers)
+                {
+                    reader.Dispose();
+                }
+
+                foreach (var stream in streams)
+                {
+                    stream.Dispose();
+                }
+
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref this.disposed, 1) != 0)
+            {
+                return;
+            }
+
+            foreach (var reader in this.Readers)
+            {
+                try { reader.Dispose(); } catch { /* best-effort */ }
+            }
+
+            foreach (var stream in this.streams)
+            {
+                try { stream.Dispose(); } catch { /* best-effort */ }
+            }
+        }
     }
 
     public partial class TidalSql
@@ -86,33 +207,19 @@ namespace TidalSqlLib
                 throw new Exception($"Table [{schema}].[{table}] does not exist in database [{database}].");
             }
 
-            // Resolve the schema and total row count up front from the Parquet footers (cheap: no
-            // column data is read). Done under a read lock so it cannot race a writer's atomic swap.
-            // For a multi-part table the schema comes from the first part; the row count sums parts.
-            List<TableStreamColumn> columns;
-            long totalRows;
-            using (TableLock.Read(source.LockKey))
-            {
-                using (Stream footerStream = File.OpenRead(source.PrimaryFile))
-                using (var reader = ParquetReader.CreateAsync(footerStream).GetAwaiter().GetResult())
-                {
-                    columns = new List<TableStreamColumn>();
-                    foreach (var field in reader.Schema.DataFields)
-                    {
-                        columns.Add(new TableStreamColumn(field.Name, TidalSqlStatementVisitor.MapClrTypeName(field.ClrType)));
-                    }
-                }
-
-                totalRows = TidalSqlStatementVisitor.CountRows(source.Files);
-            }
-
-            var order = columns.ConvertAll(c => c.Name);
+            // Pin a consistent snapshot of the table's file(s) up front: columns and the total row
+            // count are resolved from the pinned handles (under a read lock so they cannot race a
+            // writer's atomic swap), and the same handles feed the lazy stream — so TotalRows and the
+            // streamed rows are guaranteed to come from one version. For a multi-part table the schema
+            // comes from the first part; the row count sums parts.
+            var snapshot = PinnedTableSnapshot.Open(source.LockKey, source.Files);
 
             return new TableStreamResult
             {
-                Columns = columns,
-                TotalRows = totalRows,
-                Batches = TidalSqlStatementVisitor.StreamTableAsync(source.LockKey, source.Files, order, batchSize, offset, limit),
+                Columns = snapshot.Columns,
+                TotalRows = snapshot.TotalRows,
+                Batches = TidalSqlStatementVisitor.StreamPinnedAsync(snapshot, batchSize, offset, limit),
+                Snapshot = snapshot,
             };
         }
     }
@@ -120,110 +227,112 @@ namespace TidalSqlLib
     internal partial class TidalSqlStatementVisitor
     {
         /// <summary>
-        /// Streams a table's rows a Parquet row group at a time. Only one row group is decoded into
-        /// memory at once, so peak memory is bounded by the row-group size regardless of table size.
-        /// The whole scan runs under a single shared read lock, giving a consistent snapshot (files
-        /// cannot be swapped mid-scan) while still allowing concurrent readers. A table may span
-        /// several part files; they are read in order and their row groups treated as one continuous
-        /// sequence. Row groups that fall entirely outside the requested [offset, offset+limit)
-        /// window are skipped without decoding.
+        /// Streams a pinned table snapshot a Parquet row group at a time. Only one row group is decoded
+        /// into memory at once, so peak memory is bounded by the row-group size regardless of table
+        /// size. The rows come from handles pinned at open (see <see cref="PinnedTableSnapshot"/>), so
+        /// the scan sees a single consistent version without holding the table lock for the whole
+        /// (consumer-paced) drain. A table may span several part files; they are read in order and their
+        /// row groups treated as one continuous sequence. Row groups that fall entirely outside the
+        /// requested [offset, offset+limit) window are skipped without decoding. The snapshot is
+        /// released when the enumeration completes or is cancelled.
         /// </summary>
-        internal static async IAsyncEnumerable<TableRowBatch> StreamTableAsync(
-            string lockKey,
-            IReadOnlyList<string> files,
-            IReadOnlyList<string> order,
+        internal static async IAsyncEnumerable<TableRowBatch> StreamPinnedAsync(
+            PinnedTableSnapshot snapshot,
             int batchSize,
             long offset,
             long? limit,
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            using var lockScope = TableLock.Read(lockKey);
-
-            long produced = 0;
-            long globalIndex = 0;         // absolute row index of the next row to consider
-            long emittedStart = offset;   // StartIndex of the batch currently being built
-            var buffer = new List<object?[]>(batchSize);
-            var stop = limit is { } lim ? offset + lim : long.MaxValue;
-
-            foreach (var filePath in files)
+            try
             {
-                if (limit is not null && produced >= limit)
+                long produced = 0;
+                long globalIndex = 0;         // absolute row index of the next row to consider
+                long emittedStart = offset;   // StartIndex of the batch currently being built
+                var buffer = new List<object?[]>(batchSize);
+                var stop = limit is { } lim ? offset + lim : long.MaxValue;
+
+                foreach (var reader in snapshot.Readers)
                 {
-                    break;
-                }
-
-                using Stream readStream = File.OpenRead(filePath);
-                using var reader = await ParquetReader.CreateAsync(readStream);
-                var fields = reader.Schema.DataFields;
-
-                for (var g = 0; g < reader.RowGroupCount && (limit is null || produced < limit); g++)
-                {
-                    using var groupReader = reader.OpenRowGroupReader(g);
-                    var groupRows = groupReader.RowCount;
-                    var groupStart = globalIndex;
-                    var groupEnd = globalIndex + groupRows;
-
-                    // Skip whole groups that end before the window starts or begin after it ends.
-                    if (groupEnd <= offset || groupStart >= stop)
+                    if (limit is not null && produced >= limit)
                     {
-                        globalIndex = groupEnd;
-                        continue;
+                        break;
                     }
 
-                    // Decode this group's columns (columnar read), then walk only the rows in-window.
-                    var groupData = new object?[fields.Length][];
-                    for (var c = 0; c < fields.Length; c++)
-                    {
-                        var dataColumn = await groupReader.ReadColumnAsync(fields[c]);
-                        var src = dataColumn.Data;
-                        var col = new object?[src.Length];
-                        Array.Copy(src, col, src.Length);
-                        groupData[c] = col;
-                    }
+                    var fields = reader.Schema.DataFields;
 
-                    for (var i = 0; i < groupRows; i++)
+                    for (var g = 0; g < reader.RowGroupCount && (limit is null || produced < limit); g++)
                     {
-                        var abs = groupStart + i;
-                        if (abs < offset)
+                        using var groupReader = reader.OpenRowGroupReader(g);
+                        var groupRows = groupReader.RowCount;
+                        var groupStart = globalIndex;
+                        var groupEnd = globalIndex + groupRows;
+
+                        // Skip whole groups that end before the window starts or begin after it ends.
+                        if (groupEnd <= offset || groupStart >= stop)
                         {
+                            globalIndex = groupEnd;
                             continue;
                         }
 
-                        if (abs >= stop)
-                        {
-                            break;
-                        }
-
-                        var row = new object?[fields.Length];
+                        // Decode this group's columns (columnar read), then walk only the rows in-window.
+                        var groupData = new object?[fields.Length][];
                         for (var c = 0; c < fields.Length; c++)
                         {
-                            row[c] = groupData[c][i];
+                            var dataColumn = await groupReader.ReadColumnAsync(fields[c]);
+                            var src = dataColumn.Data;
+                            var col = new object?[src.Length];
+                            Array.Copy(src, col, src.Length);
+                            groupData[c] = col;
                         }
 
-                        if (buffer.Count == 0)
+                        for (var i = 0; i < groupRows; i++)
                         {
-                            emittedStart = abs;
+                            var abs = groupStart + i;
+                            if (abs < offset)
+                            {
+                                continue;
+                            }
+
+                            if (abs >= stop)
+                            {
+                                break;
+                            }
+
+                            var row = new object?[fields.Length];
+                            for (var c = 0; c < fields.Length; c++)
+                            {
+                                row[c] = groupData[c][i];
+                            }
+
+                            if (buffer.Count == 0)
+                            {
+                                emittedStart = abs;
+                            }
+
+                            buffer.Add(row);
+                            produced++;
+
+                            if (buffer.Count >= batchSize)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                yield return new TableRowBatch(emittedStart, buffer);
+                                buffer = new List<object?[]>(batchSize);
+                            }
                         }
 
-                        buffer.Add(row);
-                        produced++;
-
-                        if (buffer.Count >= batchSize)
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            yield return new TableRowBatch(emittedStart, buffer);
-                            buffer = new List<object?[]>(batchSize);
-                        }
+                        globalIndex = groupEnd;
                     }
+                }
 
-                    globalIndex = groupEnd;
+                if (buffer.Count > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    yield return new TableRowBatch(emittedStart, buffer);
                 }
             }
-
-            if (buffer.Count > 0)
+            finally
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                yield return new TableRowBatch(emittedStart, buffer);
+                snapshot.Dispose();
             }
         }
 
