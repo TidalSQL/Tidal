@@ -6,6 +6,10 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddTidalSql();
 builder.Services.AddSingleton<AuthTokenStore>();
 
+// Run the TDS (SQL Server protocol) listener in-process, so this single binary serves both the
+// web UI / REST API and native Microsoft.Data.SqlClient connections.
+builder.Services.AddHostedService<TidalSqlApi.TdsHostedService>();
+
 var app = builder.Build();
 
 // Seed the default administrator login on first run so there is always a way to sign in.
