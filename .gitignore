@@ -75,7 +75,7 @@ StyleCopReport.xml
 *_h.h
 *.ilk
 *.meta
-# TidalSql best-effort per-table usage statistics (advisory, not source)
+# TidalDb best-effort per-table usage statistics (advisory, not source)
 .access-stats.json
 *.obj
 *.iobj
@@ -363,6 +363,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
-# TidalSql persistent data (databases + server security catalog)
-TidalSqlLib/databases/
-TidalSqlLib/system/
+# TidalDb persistent data (databases + server security catalog)
+TidalDbLib/databases/
+TidalDbLib/system/

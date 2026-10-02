@@ -1,6 +1,6 @@
-# TidalSql
+# TidalDb
 
-**A T-SQL query engine over a Parquet data lake.** TidalSql lets you keep your
+**A T-SQL query engine over a Parquet data lake.** TidalDb lets you keep your
 data as plain [Apache Parquet](https://parquet.apache.org/) files on disk and
 query, join, and modify it with familiar **T-SQL** syntax — no server product,
 no proprietary storage format. It parses SQL with the same grammar SQL Server
@@ -34,7 +34,7 @@ and materializes results directly from your Parquet files.
   optional GPU column-math path via [ILGPU](https://ilgpu.net/).
 - **Two front ends** — an interactive console (REPL) and a web app with a SQL
   editor plus a REST API.
-- **Locked-down storage** — data lives in a machine-wide `%ProgramData%\TidalSql`
+- **Locked-down storage** — data lives in a machine-wide `%ProgramData%\TidalDb`
   root that can be ACL-hardened to a dedicated service account, the way SQL
   Server protects its data files.
 
@@ -44,16 +44,16 @@ and materializes results directly from your Parquet files.
 
 | Path | Description |
 |------|-------------|
-| `TidalSqlLib/` | The engine: T-SQL visitor, Parquet I/O, Delta reader, security, locking, GPU math. |
-| `TidalSqlConsole/` | Interactive console (REPL) host. |
-| `TidalSqlApi/` | ASP.NET Core web app: static SQL-editor UI (`wwwroot/`) + REST API. |
-| `TidalSqlTests/` | MSTest suite (150 tests). |
+| `TidalDbLib/` | The engine: T-SQL visitor, Parquet I/O, Delta reader, security, locking, GPU math. |
+| `TidalDbConsole/` | Interactive console (REPL) host. |
+| `TidalDbApi/` | ASP.NET Core web app: static SQL-editor UI (`wwwroot/`) + REST API. |
+| `TidalDbTests/` | MSTest suite (150 tests). |
 | `TidalScripts/` | Example SQL (e.g. `build.sql`). |
 | `tools/Secure-DataDir.ps1` | Elevated script to ACL-lock the data directory. |
-| `docs/` | User guide (`TidalSql-User-Guide.docx`) and its generator. |
+| `docs/` | User guide (`TidalDb-User-Guide.docx`) and its generator. |
 
-The engine is split into focused partial classes under `TidalSqlLib/`:
-`TidalSqlStatementVisitor.{Joins,Aggregation,Dml,Procedures,Security,Metadata,MultiPart,Delta,StreamingAggregate,Expressions,Emitters}.cs`.
+The engine is split into focused partial classes under `TidalDbLib/`:
+`TidalDbStatementVisitor.{Joins,Aggregation,Dml,Procedures,Security,Metadata,MultiPart,Delta,StreamingAggregate,Expressions,Emitters}.cs`.
 
 ---
 
@@ -61,7 +61,7 @@ The engine is split into focused partial classes under `TidalSqlLib/`:
 
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
 - Windows (the default data root uses `%ProgramData%`; other platforms work via
-  the `TIDALSQL_DATA_ROOT` override)
+  the `TIDALDB_DATA_ROOT` override)
 - An optional GPU is auto-detected; the engine falls back to CPU when none is
   available.
 
@@ -77,17 +77,17 @@ Clone and build:
 ```powershell
 git clone https://github.com/TidalSQL/Tidal.git
 cd Tidal
-dotnet build TidalSql.sln
+dotnet build TidalDb.sln
 ```
 
 ### Run the console (REPL)
 
 ```powershell
-dotnet run --project TidalSqlConsole
+dotnet run --project TidalDbConsole
 ```
 
 On first run an `admin` login is created. Set its initial password with the
-`TIDALSQL_ADMIN_PASSWORD` environment variable (otherwise a temporary password is
+`TIDALDB_ADMIN_PASSWORD` environment variable (otherwise a temporary password is
 generated and printed — change it after signing in).
 
 In the REPL you can:
@@ -106,7 +106,7 @@ SELECT TOP 10 * FROM orders;
 ### Run the web app
 
 ```powershell
-dotnet run --project TidalSqlApi
+dotnet run --project TidalDbApi
 ```
 
 Then open the printed URL. The app serves a SQL editor from `wwwroot/` and a REST
@@ -134,12 +134,12 @@ Selected REST endpoints:
 All persistent state lives under a single **data root**:
 
 ```
-%ProgramData%\TidalSql\
+%ProgramData%\TidalDb\
   databases\   # one folder per database; tables are Parquet files
   system\      # server-scoped security/system catalog (logins, roles)
 ```
 
-Override the location with the `TIDALSQL_DATA_ROOT` environment variable.
+Override the location with the `TIDALDB_DATA_ROOT` environment variable.
 
 Because the data root is a machine-wide location outside any user's source tree,
 it can be locked down at the filesystem level. `tools/Secure-DataDir.ps1`
@@ -149,26 +149,26 @@ users cannot read or tamper with the Parquet files directly:
 
 ```powershell
 # Preview
-pwsh -File tools\Secure-DataDir.ps1 -ServiceAccount "DOMAIN\svcTidalSql" -WhatIf
+pwsh -File tools\Secure-DataDir.ps1 -ServiceAccount "DOMAIN\svcTidalDb" -WhatIf
 # Apply
-pwsh -File tools\Secure-DataDir.ps1 -ServiceAccount "DOMAIN\svcTidalSql"
+pwsh -File tools\Secure-DataDir.ps1 -ServiceAccount "DOMAIN\svcTidalDb"
 ```
 
 ### Environment variables
 
 | Variable | Effect |
 |----------|--------|
-| `TIDALSQL_DATA_ROOT` | Override the data root (default `%ProgramData%\TidalSql`). |
-| `TIDALSQL_ADMIN_PASSWORD` | Initial password for the auto-created `admin` login. |
+| `TIDALDB_DATA_ROOT` | Override the data root (default `%ProgramData%\TidalDb`). |
+| `TIDALDB_ADMIN_PASSWORD` | Initial password for the auto-created `admin` login. |
 
 ---
 
 ## Delta Lake interop (read-only)
 
-TidalSql can read an **external Delta Lake table** by replaying its `_delta_log`
+TidalDb can read an **external Delta Lake table** by replaying its `_delta_log`
 (commit JSON + checkpoint Parquet), returning the current snapshot with
 tombstoned files excluded and partition columns projected in. This is
-**read-only**: TidalSql does not write Delta tables, and it rejects tables whose
+**read-only**: TidalDb does not write Delta tables, and it rejects tables whose
 reader-protocol features it does not support (e.g. deletion vectors) rather than
 returning wrong rows. Time-travel-by-version is implemented in the reader but not
 yet exposed through SQL syntax.
@@ -191,10 +191,10 @@ subset), writing Delta tables, and Delta time-travel SQL syntax.
 ## Testing
 
 ```powershell
-dotnet test TidalSql.sln
+dotnet test TidalDb.sln
 ```
 
-The suite (`TidalSqlTests`, MSTest, run sequentially) currently has **150 tests**
+The suite (`TidalDbTests`, MSTest, run sequentially) currently has **150 tests**
 covering joins/subqueries, aggregation, DML, procedures, security, multi-part and
 Delta tables, streaming, locking, and the web access layer.
 
@@ -202,7 +202,7 @@ Delta tables, streaming, locking, and the web access layer.
 
 ## Documentation
 
-A full user guide is in `docs/TidalSql-User-Guide.docx`. It is generated from
+A full user guide is in `docs/TidalDb-User-Guide.docx`. It is generated from
 `docs/_generate_user_guide.py` (via `python-docx`) — edit the script and re-run it
 to regenerate the document:
 
