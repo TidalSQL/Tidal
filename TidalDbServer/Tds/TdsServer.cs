@@ -93,8 +93,9 @@ namespace TidalDbServer.Tds
                 var connection = new TdsConnection(client, this.serverName);
                 await connection.HandleAsync(ct);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                TdsDiagnostics.Log($"Connection faulted: {ex}");
                 // A single misbehaving or disconnected client must not take down the listener.
             }
         }

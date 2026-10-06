@@ -82,16 +82,16 @@ namespace TidalDbServer.Tds
         }
     }
 
-    /// <summary>Builds the server PRELOGIN response payload advertising "encryption not supported".</summary>
+    /// <summary>Builds the server PRELOGIN response payload advertising the negotiated encryption level.</summary>
     internal static class PreLoginResponse
     {
-        public static byte[] Build()
+        public static byte[] Build(byte encryption)
         {
             // Two options (VERSION, ENCRYPTION) then a terminator. Each table entry is
             // token(1) + offset(2, big-endian) + length(2, big-endian); offsets are from payload start.
             const int tableSize = 5 + 5 + 1; // VERSION + ENCRYPTION + TERMINATOR
             var versionData = new byte[] { 16, 0, 0, 0, 0, 0 }; // UL_VERSION(4) + US_SUBBUILD(2)
-            var encryptionData = new byte[] { TdsEncryption.NotSupported };
+            var encryptionData = new byte[] { encryption };
 
             int versionOffset = tableSize;
             int encryptionOffset = versionOffset + versionData.Length;

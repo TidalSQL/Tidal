@@ -12,7 +12,8 @@ namespace TidalDbTests
     /// <summary>
     /// End-to-end tests that start the TDS server on an ephemeral loopback port and connect with the
     /// real <see cref="SqlConnection"/> client, exercising the PRELOGIN/LOGIN7 handshake and SQL batch
-    /// result streaming. Milestone 1 is unencrypted, so connections use <c>Encrypt=False</c>.
+    /// result streaming. Encryption is negotiated per connection, so both plaintext (<c>Encrypt=Optional</c>)
+    /// and TLS (<c>Encrypt=Mandatory</c>) paths are covered.
     /// </summary>
     [TestClass]
     public class TdsProtocolTests
@@ -53,17 +54,39 @@ namespace TidalDbTests
         }
 
         private string ConnectionString(string user, string password) =>
+            ConnectionString(user, password, SqlConnectionEncryptOption.Optional);
+
+        private string ConnectionString(string user, string password, SqlConnectionEncryptOption encrypt) =>
             new SqlConnectionStringBuilder
             {
                 DataSource = $"127.0.0.1,{this.port}",
                 UserID = user,
                 Password = password,
                 InitialCatalog = this.dbName,
-                Encrypt = SqlConnectionEncryptOption.Optional,
+                Encrypt = encrypt,
                 TrustServerCertificate = true,
                 ConnectTimeout = 15,
                 Pooling = false,
             }.ConnectionString;
+
+        [TestMethod]
+        public void SqlClient_CanConnectAndSelectRows_WithEncryption()
+        {
+            using var conn = new SqlConnection(
+                this.ConnectionString("admin", AdminPassword, SqlConnectionEncryptOption.Mandatory));
+            conn.Open();
+
+            using var cmd = new SqlCommand("SELECT Id, Name FROM Customer ORDER BY Id;", conn);
+            using var reader = cmd.ExecuteReader();
+
+            var ids = new System.Collections.Generic.List<int>();
+            while (reader.Read())
+            {
+                ids.Add(Convert.ToInt32(reader.GetValue(0)));
+            }
+
+            CollectionAssert.AreEqual(new[] { 1, 2, 3 }, ids);
+        }
 
         [TestMethod]
         public void SqlClient_CanConnectAndSelectRows()

@@ -8,9 +8,11 @@ namespace TidalDbServer
     using TidalDbServer.Tds;
 
     /// <summary>
-    /// Hosts the TidalDb TDS endpoint so that Microsoft.Data.SqlClient applications can connect and
-    /// run text SQL batches. Milestone 1 is unencrypted, so clients must use
-    /// <c>Encrypt=False;TrustServerCertificate=True</c>.
+    /// Hosts the TidalDb TDS endpoint so that Microsoft.Data.SqlClient applications and SQL Server
+    /// Management Studio can connect and run text SQL batches. Encryption is negotiated per connection:
+    /// clients that request it (SSMS, <c>Encrypt=Mandatory</c>) get a TLS session over a self-signed
+    /// certificate, so they should pass <c>TrustServerCertificate=True</c>; clients that opt out connect
+    /// in plaintext.
     /// </summary>
     public static class Program
     {
@@ -31,7 +33,7 @@ namespace TidalDbServer
 
             using var server = new TdsServer();
             server.Start(new IPEndPoint(IPAddress.Any, port));
-            Console.WriteLine($"TidalDb TDS server listening on port {server.Endpoint.Port} (Encrypt=False).");
+            Console.WriteLine($"TidalDb TDS server listening on port {server.Endpoint.Port} (TLS negotiated per connection).");
 
             using var shutdown = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>

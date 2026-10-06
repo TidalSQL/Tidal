@@ -171,6 +171,12 @@ namespace TidalDbTests
     [TestClass]
     public class TpchMultiPartTests
     {
+        [ClassInitialize]
+        public static void ClassInitialize(TestContext context)
+        {
+            TpchDataSet.EnsureSeeded();
+        }
+
         private static bool TpchAvailable(out string region)
         {
             region = Path.Combine(TidalDbLib.TidalDb.DatabasesRoot, "tpch", "parquet", "region");

@@ -4,6 +4,10 @@
     <ProjectReference Include="..\TidalDbLib\TidalDbLib.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="TidalDbTests" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0</TargetFramework>

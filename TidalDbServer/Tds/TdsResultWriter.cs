@@ -21,6 +21,21 @@ namespace TidalDbServer.Tds
         NVarCharMax,
     }
 
+    /// <summary>
+    /// A null column value that still carries an explicit TDS type. Synthesized result sets (e.g. the
+    /// SSMS compatibility layer) use this for columns such as <c>CAST(NULL AS int)</c> so the wire type
+    /// matches what the client's strongly-typed reader expects, instead of defaulting to NVARCHAR.
+    /// </summary>
+    internal sealed class TypedNull
+    {
+        public required ColumnKind Kind { get; init; }
+
+        public static readonly TypedNull Int = new() { Kind = ColumnKind.Int };
+        public static readonly TypedNull BigInt = new() { Kind = ColumnKind.BigInt };
+        public static readonly TypedNull Bit = new() { Kind = ColumnKind.Bit };
+        public static readonly TypedNull NVarChar = new() { Kind = ColumnKind.NVarChar };
+    }
+
     /// <summary>The resolved TDS shape of one result column.</summary>
     internal sealed class ColumnPlan
     {
@@ -129,7 +144,7 @@ namespace TidalDbServer.Tds
 
         private static void WriteValue(TdsResponseWriter w, ColumnPlan plan, object? value)
         {
-            var isNull = value is null or DBNull;
+            var isNull = value is null or DBNull or TypedNull;
 
             switch (plan.Kind)
             {
@@ -189,13 +204,32 @@ namespace TidalDbServer.Tds
         private static ColumnPlan BuildPlan(string name, QueryResult result)
         {
             object? sample = null;
+            TypedNull? hint = null;
             foreach (var row in result.Rows)
             {
-                if (row.TryGetValue(name, out var v) && v is not (null or DBNull))
+                if (!row.TryGetValue(name, out var v))
+                {
+                    continue;
+                }
+
+                if (v is TypedNull typed)
+                {
+                    hint ??= typed;
+                    continue;
+                }
+
+                if (v is not (null or DBNull))
                 {
                     sample = v;
                     break;
                 }
+            }
+
+            if (sample is null && hint is not null)
+            {
+                return hint.Kind == ColumnKind.NVarChar
+                    ? new ColumnPlan { Name = name, Kind = ColumnKind.NVarChar, NVarCharBytes = 2 }
+                    : new ColumnPlan { Name = name, Kind = hint.Kind, Precision = 38 };
             }
 
             var kind = sample switch
