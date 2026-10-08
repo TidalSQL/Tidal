@@ -215,7 +215,38 @@ namespace TidalDbTests
             var result = this.db.ExecuteQuery("SELECT * FROM sys.databases;");
 
             Assert.IsTrue(result.Success);
-            CollectionAssert.AreEqual(new[] { "name" }, result.Columns);
+            // sys.databases exposes the SMO/SSMS metadata columns; name and state are the key ones.
+            CollectionAssert.Contains(result.Columns, "name");
+            CollectionAssert.Contains(result.Columns, "state");
+            Assert.IsTrue(result.Rows.Any(r => (string)r["name"]! == this.dbName));
+        }
+
+        [TestMethod]
+        public void ListDatabases_SmoEnumeration_BitConstantIsBoolean()
+        {
+            // Mirrors SMO's Object Explorer database enumeration. CAST(0 AS bit) must evaluate to a CLR
+            // bool so the TDS layer surfaces a real bit column (SMO reads it with GetBoolean).
+            var result = this.db.ExecuteQuery(
+                "SELECT dtb.name AS [Name], CAST(0 AS bit) AS [IsFabricDatabase] " +
+                "FROM master.sys.databases AS dtb ORDER BY [Name] ASC;");
+
+            Assert.IsTrue(result.Success);
+            CollectionAssert.Contains(result.Columns, "Name");
+            CollectionAssert.Contains(result.Columns, "IsFabricDatabase");
+            var row = result.Rows.First();
+            Assert.IsInstanceOfType(row["IsFabricDatabase"], typeof(bool));
+            Assert.AreEqual(false, row["IsFabricDatabase"]);
+        }
+
+        [TestMethod]
+        public void CastAsBit_ComparesAsZeroOrOne()
+        {
+            // Bit (bool) must still compare against integer literals, e.g. SMO's WHERE CAST(..AS bit)=0.
+            var result = this.db.ExecuteQuery(
+                "SELECT name FROM sys.databases WHERE CAST(1 AS bit) = 1;");
+
+            Assert.IsTrue(result.Success);
+            Assert.IsTrue(result.Rows.Count > 0);
         }
 
         [TestMethod]
@@ -273,6 +304,74 @@ namespace TidalDbTests
             Assert.IsFalse(result.Success);
             StringAssert.Contains(result.Message, "No database selected");
             StringAssert.Contains(result.Message, "USE <database>");
+        }
+
+        [TestMethod]
+        public void OrderBy_ResolvesSelectListAlias()
+        {
+            // SSMS/SMO order catalog listings by a SELECT alias (e.g. [Schema]) that is not a
+            // real source column. The alias must resolve to its underlying expression.
+            var result = this.db.ExecuteQuery(
+                "SELECT SCHEMA_NAME(tbl.schema_id) AS [Schema], tbl.name AS [Name] " +
+                "FROM sys.tables AS tbl ORDER BY [Schema] ASC, [Name] ASC;");
+
+            Assert.IsTrue(result.Success, result.Message);
+            CollectionAssert.AreEqual(new[] { "Schema", "Name" }, result.Columns);
+            var names = result.Rows.Select(r => (string)r["Name"]!).ToList();
+            CollectionAssert.Contains(names, "Emp");
+            // Verify the rows are actually sorted by Name (schema is constant 'dbo').
+            var sorted = names.OrderBy(n => n, System.StringComparer.OrdinalIgnoreCase).ToList();
+            CollectionAssert.AreEqual(sorted, names);
+        }
+
+        [TestMethod]
+        public void SchemaName_ReturnsDbo()
+        {
+            var result = this.db.ExecuteQuery("SELECT SCHEMA_NAME(1) AS s;");
+
+            Assert.IsTrue(result.Success, result.Message);
+            Assert.AreEqual("dbo", result.Rows.Single()["s"]);
+        }
+
+        [TestMethod]
+        public void SysTables_SmoEnumeration_ExposesSchemaAndObjectId()
+        {
+            // Exact shape of SMO's Tables-node query.
+            var result = this.db.ExecuteQuery(
+                "SELECT SCHEMA_NAME(tbl.schema_id) AS [Schema], tbl.name AS [Name], tbl.object_id AS [ID] " +
+                "FROM sys.tables AS tbl ORDER BY [Schema] ASC, [Name] ASC;");
+
+            Assert.IsTrue(result.Success, result.Message);
+            var emp = result.Rows.Single(r => (string)r["Name"]! == "Emp");
+            Assert.AreEqual("dbo", emp["Schema"]);
+            Assert.IsInstanceOfType(emp["ID"], typeof(int));
+        }
+
+        [TestMethod]
+        public void SysAllViews_ReturnsEmptyShapeWhenNoViews()
+        {
+            var result = this.db.ExecuteQuery(
+                "SELECT SCHEMA_NAME(v.schema_id) AS [Schema], v.name AS [Name] " +
+                "FROM sys.all_views AS v WHERE (v.type = N'V') ORDER BY [Schema] ASC, [Name] ASC;");
+
+            Assert.IsTrue(result.Success, result.Message);
+            CollectionAssert.AreEqual(new[] { "Schema", "Name" }, result.Columns);
+        }
+
+        [TestMethod]
+        public void SysAllColumns_JoinsToTablesByObjectId()
+        {
+            // SMO's column-enumeration query joins sys.tables to sys.all_columns on object_id.
+            var result = this.db.ExecuteQuery(
+                "SELECT clmns.column_id AS [ID], clmns.name AS [Name] " +
+                "FROM sys.tables AS tbl " +
+                "INNER JOIN sys.all_columns AS clmns ON clmns.object_id = tbl.object_id " +
+                "WHERE (tbl.name = N'Emp' AND SCHEMA_NAME(tbl.schema_id) = N'dbo') " +
+                "ORDER BY [ID] ASC;");
+
+            Assert.IsTrue(result.Success, result.Message);
+            var names = result.Rows.Select(r => (string)r["Name"]!).ToList();
+            CollectionAssert.AreEqual(new[] { "Id", "Name", "Salary" }, names);
         }
     }
 }

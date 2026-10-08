@@ -34,12 +34,29 @@ namespace TidalDbServer.Tds
         /// batch is a normal query that must be executed by the engine.
         /// </summary>
         public static bool TryHandle(string sql, out List<QueryResult> resultSets)
+            => TryHandle(sql, null, out resultSets);
+
+        /// <summary>
+        /// As <see cref="TryHandle(string, out List{QueryResult})"/>, but also able to answer SSMS Object
+        /// Explorer's Databases-folder enumeration when a <paramref name="databaseSource"/> is supplied.
+        /// </summary>
+        public static bool TryHandle(string sql, Func<IReadOnlyList<TidalDb.ExplorerDatabase>>? databaseSource, out List<QueryResult> resultSets)
         {
             resultSets = new List<QueryResult>();
             var text = sql.Trim();
             if (text.Length == 0)
             {
                 return false;
+            }
+
+            // SSMS Object Explorer's Databases folder issues a large multi-statement batch (temp table +
+            // IF serverproperty(...) + an ~83-column SELECT from sys.databases with LEFT JOINs to catalog
+            // views the engine lacks, run in master context). It fails in the engine, so the folder never
+            // populates. Synthesize the rows directly from the real on-disk databases.
+            if (databaseSource != null && IsDatabasesEnumeration(text))
+            {
+                resultSets.Add(BuildDatabasesEnumerationResult(text, databaseSource));
+                return true;
             }
 
             // The server-information probe SSMS runs immediately after login (DatabaseEngineType,
@@ -92,10 +109,41 @@ namespace TidalDbServer.Tds
                 return true;
             }
 
+            // SMO's full Server-properties probe (a large multi-statement DECLARE/SET/SELECT batch that
+            // reports AuditLevel, LoginMode, Collation, MasterDBPath, etc.). It uses @@globals,
+            // xp_instance_regread, msdb policy functions and suser_sname — none of which the engine
+            // implements — and it gates Object Explorer: if it fails, SMO aborts before enumerating
+            // databases. Answer with a synthesized single row of plausible server settings.
+            if (Contains(text, "[AuditLevel]") && Contains(text, "[LoginMode]") && Contains(text, "[MasterDBPath]"))
+            {
+                resultSets.Add(BuildServerSettingsRow());
+                return true;
+            }
+
             // A batch made up only of SET session options (QUOTED_IDENTIFIER, ANSI_NULLS, LOCK_TIMEOUT,
             // TRANSACTION ISOLATION LEVEL, DATEFORMAT, LANGUAGE, ...) — accept and return no rows.
             if (IsSetOnlyBatch(text))
             {
+                return true;
+            }
+
+            // After enumerating databases, SMO reads server-level sp_configure settings from
+            // sys.configurations (default language/full-text language, nested triggers, two-digit year
+            // cutoff). The engine has no sys.configurations and runs in master context, so synthesize it.
+            if (Contains(text, "sys.configurations") && Contains(text, "configuration_id"))
+            {
+                resultSets.Add(BuildConfigurationsResult(text));
+                return true;
+            }
+
+            // SSMS Object Explorer constructs a DMF PolicyStore while evaluating the server node's state
+            // (NavigableItem.get_State -> PolicyStore..ctor). The probe SELECTs PolicyStore properties from
+            // msdb.dbo.syspolicy_configuration using quotename(); the engine implements neither, so it fails
+            // and the server node enters an error state (red X) BEFORE the Databases folder is enumerated —
+            // which is why user databases never appear. Answer with a benign, disabled-policy row.
+            if (Contains(text, "PolicyStore[@Name=") || Contains(text, "syspolicy_configuration"))
+            {
+                resultSets.Add(BuildPolicyStoreRow());
                 return true;
             }
 
@@ -144,6 +192,9 @@ namespace TidalDbServer.Tds
                 return false;
             }
 
+            // A trailing ORDER BY over a from-less projection is a no-op for a single synthesized row.
+            body = Regex.Replace(body, @"\s+order\s+by\s+.*$", string.Empty, ReOpts).TrimEnd();
+
             // Only plain scalar projections — reject anything with a FROM/JOIN/WHERE or set operation.
             if (Regex.IsMatch(body, @"\b(from|join|where|into|union)\b", ReOpts))
             {
@@ -184,6 +235,52 @@ namespace TidalDbServer.Tds
 
             result.Rows.Add(row);
             return true;
+        }
+
+        /// <summary>Splits on top-level <c>+</c> concatenation operators outside quotes and parentheses.</summary>
+        private static IEnumerable<string> SplitTopLevelConcat(string s)
+        {
+            var depth = 0;
+            var inQuote = false;
+            var start = 0;
+            for (var i = 0; i < s.Length; i++)
+            {
+                var c = s[i];
+                if (c == '\'')
+                {
+                    inQuote = !inQuote;
+                }
+                else if (!inQuote && c == '(')
+                {
+                    depth++;
+                }
+                else if (!inQuote && c == ')')
+                {
+                    depth--;
+                }
+                else if (!inQuote && depth == 0 && c == '+')
+                {
+                    yield return s.Substring(start, i - start);
+                    start = i + 1;
+                }
+            }
+
+            if (start <= s.Length)
+            {
+                yield return s.Substring(start);
+            }
+        }
+
+        /// <summary>Emulates T-SQL QUOTENAME: wraps a value in the given delimiter, doubling any inside.</summary>
+        private static string QuoteName(string value, string delimiter)
+        {
+            var open = delimiter.Length > 0 ? delimiter[0] : '[';
+            return open switch
+            {
+                '\'' => "'" + value.Replace("'", "''") + "'",
+                '"' => "\"" + value.Replace("\"", "\"\"") + "\"",
+                _ => "[" + value.Replace("]", "]]") + "]",
+            };
         }
 
         /// <summary>Splits a comma-separated list on commas that sit at paren depth zero and outside quotes.</summary>
@@ -347,6 +444,20 @@ namespace TidalDbServer.Tds
                 }
             }
 
+            // String concatenation (a + b + c) at paren depth zero.
+            var concat = SplitTopLevelConcat(expr).Select(p => p.Trim()).ToList();
+            if (concat.Count > 1)
+            {
+                var values = concat.Select(EvaluateScalar).ToList();
+                if (values.Any(IsNullish))
+                {
+                    return null;
+                }
+
+                return string.Concat(values.Select(
+                    v => System.Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture)));
+            }
+
             // CAST(inner AS type) -> evaluate inner.
             var cast = Regex.Match(expr, @"^cast\s*\((.*)\s+as\s+[^\)]+\)$", ReOpts);
             if (cast.Success)
@@ -422,6 +533,15 @@ namespace TidalDbServer.Tds
                 case "CONVERT":
                     // CONVERT(type, inner [, style]) -> evaluate the second argument.
                     return args.Count >= 2 ? EvaluateScalar(args[1]) : null;
+                case "QUOTENAME":
+                {
+                    var value = args.Count > 0
+                        ? System.Convert.ToString(
+                            EvaluateScalar(args[0]), System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty
+                        : string.Empty;
+                    var delimiter = args.Count > 1 ? Unquote(args[1]) : "[";
+                    return QuoteName(value, delimiter);
+                }
                 case "ISNULL":
                 case "COALESCE":
                     foreach (var a in args)
@@ -549,7 +669,7 @@ namespace TidalDbServer.Tds
             "IS_MEMBER", "IS_ROLEMEMBER", "HAS_PERMS_BY_NAME", "SUSER_SNAME", "SUSER_NAME",
             "SUSER_ID", "ORIGINAL_LOGIN", "USER_NAME", "USER_ID", "DB_NAME", "DB_ID",
             "SCHEMA_NAME", "SCHEMA_ID", "OBJECT_ID", "OBJECT_NAME", "FULLTEXTSERVICEPROPERTY",
-            "DATABASEPROPERTYEX", "COLLATIONPROPERTY",
+            "DATABASEPROPERTYEX", "COLLATIONPROPERTY", "QUOTENAME",
         };
 
         private static readonly Dictionary<string, object?> NiladicValues =
@@ -563,7 +683,642 @@ namespace TidalDbServer.Tds
         private static bool Contains(string haystack, string needle) =>
             haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
 
-        /// <summary>Builds a single-row result set from ordered (columnName, value) pairs.</summary>
+        private static readonly Regex DatabasesFromRe =
+            new(@"from\s+(?:master\s*\.\s*)?sys\.databases\s+(?:as\s+)?dtb\b", ReOpts);
+
+        /// <summary>
+        /// Recognises any SSMS/SMO enumeration of <c>sys.databases AS dtb</c> — the Object Explorer
+        /// Databases folder, its System Databases / Snapshots subfolders, and single-database refreshes.
+        /// Each variant SMO sends is a <em>different</em> column subset (with <c>Database_</c>-prefixed
+        /// aliases, read by ordinal), so detection is by the FROM clause alone, not the SELECT list.
+        /// </summary>
+        private static bool IsDatabasesEnumeration(string text) => DatabasesFromRe.IsMatch(text);
+
+        private static readonly string[] SystemDatabaseNames = { "master", "tempdb", "model", "msdb" };
+
+        /// <summary>
+        /// Synthesizes the Databases-folder result SSMS expects. SMO's Database object reads ~80 typed
+        /// properties per row; a missing column or wrong wire type makes the whole folder fail to expand.
+        /// The WHERE filter SMO appends selects a variant: system databases (<c>... AS bit)=1</c>), user
+        /// databases (<c>=0</c>), a single named database, or snapshots (always empty here).
+        /// </summary>
+        private static QueryResult BuildDatabasesEnumerationResult(string text, Func<IReadOnlyList<TidalDb.ExplorerDatabase>> databaseSource)
+        {
+            // SMO reads each result set BY ORDINAL, and every Object Explorer action requests a different
+            // column subset. So the only robust answer is to echo exactly the SELECT list SMO sent — in
+            // order — resolving each aliased column to a correctly-typed synthesized value.
+            var columns = ExtractDatabasesSelectColumns(text);
+            var rows = SelectDatabaseRows(text, databaseSource);
+
+            var result = new QueryResult { Success = true };
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var emitted = new List<(string Expr, string Alias, string Key)>();
+            var index = 0;
+            foreach (var (expr, alias) in columns)
+            {
+                var original = alias ?? DeriveDatabaseColumnName(expr, index);
+                var key = original;
+                var suffix = 1;
+                while (!seen.Add(key))
+                {
+                    key = original + "_" + suffix++;
+                }
+
+                emitted.Add((expr, original, key));
+                result.Columns.Add(key);
+                index++;
+            }
+
+            foreach (var db in rows)
+            {
+                var row = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var (expr, alias, key) in emitted)
+                {
+                    row[key] = ResolveDatabaseColumn(expr, alias, db);
+                }
+
+                result.Rows.Add(row);
+            }
+
+            result.RowCount = rows.Count;
+            return result;
+        }
+
+        /// <summary>
+        /// Extracts the depth-0 SELECT column list that feeds the <c>sys.databases AS dtb</c> FROM clause,
+        /// as (expression, alias) pairs in SELECT order. Subquery SELECTs (inside parens) and SELECTs
+        /// embedded in string literals (e.g. the batch's <c>exec sp_executesql N'...'</c> preamble) are
+        /// skipped, so only the real projection is parsed.
+        /// </summary>
+        private static IReadOnlyList<(string Expr, string? Alias)> ExtractDatabasesSelectColumns(string text)
+            => ExtractSelectColumns(text, DatabasesFromRe);
+
+        /// <summary>Index just past the last depth-0, unquoted <c>SELECT</c> keyword before <paramref name="before"/>.</summary>
+        private static int LastTopLevelSelectEnd(string text, int before)
+        {
+            var depth = 0;
+            var inQuote = false;
+            var result = -1;
+            for (var i = 0; i < before; i++)
+            {
+                var c = text[i];
+                if (c == '\'')
+                {
+                    inQuote = !inQuote;
+                    continue;
+                }
+
+                if (inQuote)
+                {
+                    continue;
+                }
+
+                if (c == '(')
+                {
+                    depth++;
+                }
+                else if (c == ')')
+                {
+                    depth--;
+                }
+                else if (depth == 0 && (c is 's' or 'S') &&
+                    i + 6 <= text.Length &&
+                    string.Compare(text, i, "select", 0, 6, StringComparison.OrdinalIgnoreCase) == 0 &&
+                    (i == 0 || !IsWordChar(text[i - 1])) &&
+                    (i + 6 >= text.Length || !IsWordChar(text[i + 6])))
+                {
+                    result = i + 6;
+                }
+            }
+
+            return result;
+        }
+
+        private static bool IsWordChar(char c) => char.IsLetterOrDigit(c) || c == '_';
+
+        /// <summary>
+        /// Returns the last match of <paramref name="re"/> in <paramref name="text"/>. The real Object
+        /// Explorer databases query mentions <c>sys.databases AS dtb</c> several times — twice inside the
+        /// HADR temp-table preamble and finally in the real projection — so callers must key off the
+        /// LAST occurrence (the projection) rather than the first (a preamble helper SELECT).
+        /// </summary>
+        private static Match LastMatch(Regex re, string text)
+        {
+            var last = Match.Empty;
+            for (var m = re.Match(text); m.Success; m = m.NextMatch())
+            {
+                last = m;
+            }
+
+            return last;
+        }
+
+        /// <summary>
+        /// Selects which databases a Databases-enumeration query targets by inspecting its WHERE clause:
+        /// a single named database, the System Databases subfolder (<c>... AS bit)=1</c>), the Snapshots
+        /// subfolder (always empty), or — the one that matters — the user Databases folder.
+        /// </summary>
+        private static List<DatabaseRow> SelectDatabaseRows(string text, Func<IReadOnlyList<TidalDb.ExplorerDatabase>> databaseSource)
+        {
+            var rows = new List<DatabaseRow>();
+
+            var from = LastMatch(DatabasesFromRe, text);
+            var where = from.Success ? text.Substring(from.Index + from.Length) : text;
+
+            var nameMatch = Regex.Match(where, @"\[?dtb\]?\.\[?name\]?\s*=\s*N'([^']*)'", ReOpts);
+
+            // The snapshots subfolder *wants* snapshots: "...source_database_id...) AS bit)=N'1'" or
+            // "source_database_id is not null". The user/system Databases folders *exclude* them with
+            // "...isnull(dtb.source_database_id,0) AS bit)=N'0'", which must NOT be treated as snapshots.
+            var wantsSnapshots = Regex.IsMatch(where, @"source_database_id[^)]*\)\s*AS\s+bit\s*\)\s*=\s*N?'?1'?", ReOpts)
+                || Regex.IsMatch(where, @"source_database_id\s+is\s+not\s+null", ReOpts);
+
+            // The System Databases folder filters the is_distributor/system bit to 1:
+            // "...else dtb.is_distributor end AS bit)=N'1'".
+            var systemFilter = Regex.Match(where, @"is_distributor\s+end\s+AS\s+bit\s*\)\s*=\s*N?'?([01])'?", ReOpts);
+
+            if (nameMatch.Success)
+            {
+                var wanted = nameMatch.Groups[1].Value;
+                var sysIdx = Array.FindIndex(SystemDatabaseNames, n => string.Equals(n, wanted, StringComparison.OrdinalIgnoreCase));
+                if (sysIdx >= 0)
+                {
+                    rows.Add(new DatabaseRow(SystemDatabaseNames[sysIdx], sysIdx + 1, CatalogEpoch, true, false));
+                }
+                else
+                {
+                    foreach (var db in databaseSource())
+                    {
+                        if (string.Equals(db.Name, wanted, StringComparison.OrdinalIgnoreCase))
+                        {
+                            rows.Add(new DatabaseRow(db.Name, db.Id, db.CreateDate, false, false));
+                        }
+                    }
+                }
+            }
+            else if (wantsSnapshots)
+            {
+                // No snapshots — return the empty, correctly-shaped result.
+            }
+            else if (systemFilter.Success && systemFilter.Groups[1].Value == "1")
+            {
+                for (var i = 0; i < SystemDatabaseNames.Length; i++)
+                {
+                    rows.Add(new DatabaseRow(SystemDatabaseNames[i], i + 1, CatalogEpoch, true, false));
+                }
+            }
+            else
+            {
+                foreach (var db in databaseSource())
+                {
+                    rows.Add(new DatabaseRow(db.Name, db.Id, db.CreateDate, false, false));
+                }
+            }
+
+            return rows;
+        }
+
+        private readonly record struct DatabaseRow(string Name, int Id, DateTime CreateDate, bool System, bool IsSnapshot);
+
+        private static readonly DateTime CatalogEpoch = new(2020, 1, 1);
+
+        private static string DeriveDatabaseColumnName(string expr, int index)
+        {
+            var dotted = Regex.Match(expr, @"([A-Za-z_][A-Za-z0-9_]*)\s*$", ReOpts);
+            return dotted.Success ? dotted.Groups[1].Value : "Column" + index;
+        }
+
+        /// <summary>
+        /// Resolves one Databases-enumeration column to a correctly-typed synthesized value. Per-database
+        /// columns (name/id/urn/...) come from <paramref name="db"/>; the rest fall back to a static
+        /// default surface, then to type inference from the SELECT expression (so unseen columns still get
+        /// a value of the right wire type rather than crashing SMO's by-ordinal reader).
+        /// </summary>
+        private static object? ResolveDatabaseColumn(string expr, string alias, DatabaseRow db)
+        {
+            var key = alias.StartsWith("Database_", StringComparison.OrdinalIgnoreCase)
+                ? alias.Substring("Database_".Length)
+                : alias;
+
+            switch (key.ToLowerInvariant())
+            {
+                case "name":
+                case "databasename":
+                case "databasename2":
+                case "databasename3":
+                case "databasename6":
+                    return db.Name;
+                case "urn":
+                    return $"Server[@Name='{Environment.MachineName}']/Database[@Name='{db.Name.Replace("'", "''")}']";
+                case "id":
+                    return db.Id;
+                case "createdate":
+                    return db.CreateDate;
+                case "issystemobject":
+                    return db.System;
+                case "isdatabasesnapshot":
+                    return db.IsSnapshot;
+            }
+
+            if (DatabaseColumnDefaults.TryGetValue(key, out var value))
+            {
+                return value;
+            }
+
+            return InferDatabaseColumnFromExpr(expr);
+        }
+
+        /// <summary>Infers a typed value for a database column SMO requested that has no explicit default.</summary>
+        private static object? InferDatabaseColumnFromExpr(string expr)
+        {
+            var cast = Regex.Match(
+                expr,
+                @"\bas\s+(bit|tinyint|smallint|int|bigint|datetime2|datetime|date|uniqueidentifier|sysname|nvarchar|varchar|nchar|char)\b",
+                ReOpts);
+            if (cast.Success)
+            {
+                return cast.Groups[1].Value.ToLowerInvariant() switch
+                {
+                    "bit" => false,
+                    "tinyint" => (byte)0,
+                    "smallint" => (short)0,
+                    "int" => 0,
+                    "bigint" => 0L,
+                    "datetime" or "datetime2" or "date" => new DateTime(1900, 1, 1),
+                    "uniqueidentifier" => Guid.Empty,
+                    _ => string.Empty,
+                };
+            }
+
+            // String-returning catalog functions SMO wraps around owner/quoted names.
+            if (Regex.IsMatch(expr, @"\b(quotename|suser_sname|db_name)\b", ReOpts))
+            {
+                return string.Empty;
+            }
+
+            // Status is composed via "case dtb.state ..." and/or bitwise OR of state bits.
+            if (Regex.IsMatch(expr, @"\bstate\b", ReOpts) || expr.Contains('|'))
+            {
+                return 1;
+            }
+
+            // Bare on-disk boolean flags (dtb.is_...), e.g. dtb.is_auto_shrink_on.
+            if (Regex.IsMatch(expr, @"\bdtb\.\[?is_", ReOpts))
+            {
+                return false;
+            }
+
+            var number = expr.Trim();
+            if (Regex.IsMatch(number, @"^-?\d+$") && int.TryParse(number, out var n))
+            {
+                return n;
+            }
+
+            return TypedNull.NVarChar;
+        }
+
+        /// <summary>
+        /// The static Database-property surface (everything that is not per-database), keyed by SMO alias
+        /// (the <c>Database_</c> prefix stripped). Covers both the Object Explorer folder queries and the
+        /// full SFC-enumerated property set. Values must be the CLR type matching each column's wire type.
+        /// </summary>
+        private static readonly Dictionary<string, object?> DatabaseColumnDefaults = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["AnsiNullDefault"] = false,
+            ["AnsiNullsEnabled"] = false,
+            ["AnsiPaddingEnabled"] = false,
+            ["AnsiWarningsEnabled"] = false,
+            ["ArithmeticAbortEnabled"] = false,
+            ["AutoShrink"] = false,
+            ["CloseCursorsOnCommitEnabled"] = false,
+            ["ConcatenateNullYieldsNull"] = false,
+            ["NumericRoundAbortEnabled"] = false,
+            ["QuotedIdentifiersEnabled"] = false,
+            ["ReadOnly"] = false,
+            ["RecursiveTriggersEnabled"] = false,
+            ["UserAccess"] = (byte)0,
+            ["Status"] = 1,
+            ["CompatibilityLevel"] = (byte)160,
+            ["Collation"] = "SQL_Latin1_General_CP1_CI_AS",
+            ["CollationName"] = "SQL_Latin1_General_CP1_CI_AS",
+            ["DatabaseOwnershipChaining"] = false,
+            ["AutoUpdateStatisticsAsync"] = false,
+            ["DateCorrelationOptimization"] = false,
+            ["Trustworthy"] = false,
+            ["AutoCreateStatisticsEnabled"] = true,
+            ["AutoUpdateStatisticsEnabled"] = true,
+            ["IsParameterizationForced"] = false,
+            ["IsReadCommittedSnapshotOn"] = false,
+            ["DatabaseSnapshotBaseName"] = string.Empty,
+            ["IsFullTextEnabled"] = false,
+            ["ServiceBrokerGuid"] = Guid.Empty,
+            ["SnapshotIsolationState"] = (byte)0,
+            ["ReplicationOptions"] = 0,
+            ["LocalCursorsDefault"] = false,
+            ["PageVerify"] = (byte)2,
+            ["RecoveryModel"] = (byte)3,
+            ["AutoClose"] = false,
+            ["BrokerEnabled"] = false,
+            ["Owner"] = "sa",
+            ["LogReuseWaitStatus"] = 0,
+            ["RecoveryForkGuid"] = Guid.Empty,
+            ["DatabaseGuid"] = Guid.Empty,
+            ["HasFullBackup"] = false,
+            ["ChangeTrackingEnabled"] = false,
+            ["ChangeTrackingAutoCleanUp"] = false,
+            ["ChangeTrackingRetentionPeriod"] = 0,
+            ["ChangeTrackingRetentionPeriodUnits"] = (byte)0,
+            ["ContainmentType"] = (byte)0,
+            ["Containment"] = (byte)0,
+            ["DefaultLanguageLcid"] = 1033,
+            ["DefaultLanguageName"] = "us_english",
+            ["DefaultFullTextLanguageLcid"] = 1033,
+            ["DefaultFullTextLanguageName"] = "English",
+            ["NestedTriggersEnabled"] = true,
+            ["TransformNoiseWords"] = false,
+            ["TwoDigitYearCutoff"] = (short)2049,
+            ["TargetRecoveryTime"] = 60,
+            ["DelayedDurability"] = 0,
+            ["AutoCreateIncrementalStatisticsEnabled"] = false,
+            ["IsLedger"] = false,
+            ["IsUpdateable"] = true,
+            ["EncryptionEnabled"] = false,
+            ["HonorBrokerPriority"] = false,
+            ["IsSqlDw"] = false,
+            ["IsAccessible"] = true,
+            ["IsFabricDatabase"] = false,
+            ["FilestreamDirectoryName"] = string.Empty,
+            ["FilestreamNonTransactedAccess"] = 0,
+            ["RemoteDataArchiveEnabled"] = false,
+            ["MaxDop"] = 0,
+            ["MaxDopForSecondary"] = TypedNull.Int,
+            ["LegacyCardinalityEstimation"] = 0,
+            ["LegacyCardinalityEstimationForSecondary"] = 2,
+            ["ParameterSniffing"] = 0,
+            ["ParameterSniffingForSecondary"] = 2,
+            ["QueryOptimizerHotfixes"] = 0,
+            ["QueryOptimizerHotfixesForSecondary"] = 2,
+            ["CatalogCollation"] = 0,
+            ["LastGoodCheckDbTime"] = new DateTime(1900, 1, 1),
+            ["AcceleratedRecoveryEnabled"] = false,
+            ["DataRetentionEnabled"] = false,
+            ["ContainmentType2"] = (byte)0,
+        };
+
+        /// <summary>
+        /// Synthesizes the server-level sp_configure rows SMO reads from <c>sys.configurations</c>. SMO
+        /// sends several variants (a full enumeration, or a single <c>value_in_use</c> probe for one
+        /// configuration_id), read by ordinal, so the result echoes exactly the SELECT list and honours
+        /// the WHERE configuration_id filter.
+        /// </summary>
+        /// <summary>
+        /// Synthesizes the single row SSMS's DMF PolicyStore probe expects (Policy-Based Management is
+        /// disabled). The real query reads <c>msdb.dbo.syspolicy_configuration</c> and uses
+        /// <c>quotename()</c>, neither of which the engine implements; left to the engine it fails and the
+        /// Object Explorer server node enters an error state before databases are enumerated.
+        /// </summary>
+        private static QueryResult BuildPolicyStoreRow()
+        {
+            var machine = Environment.MachineName;
+            return Row(
+                ("Urn", $"PolicyStore[@Name='{machine}']"),
+                ("Name", machine),
+                ("Enabled", false),
+                ("HistoryRetentionInDays", 0),
+                ("LogOnSuccess", false));
+        }
+
+        private static QueryResult BuildConfigurationsResult(string text)
+        {
+            var columns = ExtractSelectColumns(text, ConfigurationsFromRe);
+            if (columns.Count == 0)
+            {
+                // Fallback to the canonical shape when the SELECT list can't be parsed.
+                columns = new[]
+                {
+                    ((string)"cfg.value", (string?)"value"),
+                    ("cfg.name", "name"),
+                    ("cfg.configuration_id", "configuration_id"),
+                };
+            }
+
+            var requested = ExtractConfigurationIds(text);
+            var ids = requested.Count > 0
+                ? requested
+                : new List<int> { 115, 124, 1126, 1127, 1555 };
+
+            var result = new QueryResult { Success = true };
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var emitted = new List<(string Expr, string Alias, string Key)>();
+            var index = 0;
+            foreach (var (expr, alias) in columns)
+            {
+                var original = alias ?? DeriveDatabaseColumnName(expr, index);
+                var key = original;
+                var suffix = 1;
+                while (!seen.Add(key))
+                {
+                    key = original + "_" + suffix++;
+                }
+
+                emitted.Add((expr, original, key));
+                result.Columns.Add(key);
+                index++;
+            }
+
+            foreach (var id in ids)
+            {
+                var row = new Dictionary<string, object?>(StringComparer.Ordinal);
+                foreach (var (expr, alias, key) in emitted)
+                {
+                    row[key] = ResolveConfigurationColumn(alias, id);
+                }
+
+                result.Rows.Add(row);
+            }
+
+            result.RowCount = result.Rows.Count;
+            return result;
+        }
+
+        private static readonly Regex ConfigurationsFromRe =
+            new(@"from\s+sys\.configurations\b", ReOpts);
+
+        private static readonly Dictionary<int, (int Value, string? Name)> ConfigurationValues = new()
+        {
+            [115] = (1, null),           // nested triggers (enabled)
+            [124] = (1033, "us_english"), // default language
+            [1126] = (1033, "English"),  // default full-text language
+            [1127] = (2049, null),       // two digit year cutoff
+            [1555] = (0, null),          // default language alt slot
+        };
+
+        private static object? ResolveConfigurationColumn(string alias, int id)
+        {
+            ConfigurationValues.TryGetValue(id, out var cfg);
+            switch (alias.ToLowerInvariant())
+            {
+                case "value":
+                case "value_in_use":
+                    return cfg.Value;
+                case "name":
+                    return cfg.Name ?? (object)TypedNull.NVarChar;
+                case "configuration_id":
+                    return id;
+                case "minimum":
+                    return 0;
+                case "maximum":
+                    return int.MaxValue;
+                case "is_dynamic":
+                case "is_advanced":
+                    return false;
+                case "description":
+                    return string.Empty;
+                default:
+                    return cfg.Value;
+            }
+        }
+
+        /// <summary>Extracts the configuration_id values a sys.configurations query filters on (IN list or =).</summary>
+        private static List<int> ExtractConfigurationIds(string text)
+        {
+            var ids = new List<int>();
+            var inList = Regex.Match(text, @"configuration_id\s+in\s*\(([^)]*)\)", ReOpts);
+            if (inList.Success)
+            {
+                foreach (Match m in Regex.Matches(inList.Groups[1].Value, @"-?\d+"))
+                {
+                    if (int.TryParse(m.Value, out var v))
+                    {
+                        ids.Add(v);
+                    }
+                }
+            }
+            else
+            {
+                var eq = Regex.Match(text, @"configuration_id\s*=\s*N?'?(-?\d+)'?", ReOpts);
+                if (eq.Success && int.TryParse(eq.Groups[1].Value, out var v))
+                {
+                    ids.Add(v);
+                }
+            }
+
+            return ids;
+        }
+
+        /// <summary>
+        /// Extracts a query's depth-0 SELECT column list (as expression/alias pairs) when it projects from
+        /// the table matched by <paramref name="fromRe"/>. Shared by the sys.databases and sys.configurations
+        /// handlers, both of which must echo the client's exact column shape for its by-ordinal reader.
+        /// </summary>
+        private static IReadOnlyList<(string Expr, string? Alias)> ExtractSelectColumns(string text, Regex fromRe)
+        {
+            var from = LastMatch(fromRe, text);
+            if (!from.Success)
+            {
+                return Array.Empty<(string, string?)>();
+            }
+
+            var listStart = LastTopLevelSelectEnd(text, from.Index);
+            if (listStart < 0 || listStart >= from.Index)
+            {
+                return Array.Empty<(string, string?)>();
+            }
+
+            var columnList = text.Substring(listStart, from.Index - listStart);
+            columnList = Regex.Replace(columnList.TrimStart(), @"^(all|distinct)\s+", string.Empty, ReOpts);
+            columnList = Regex.Replace(columnList, @"^top\s*\(\s*\d+\s*\)\s+", string.Empty, ReOpts);
+            columnList = Regex.Replace(columnList, @"^top\s+\d+\s+", string.Empty, ReOpts);
+
+            var columns = new List<(string, string?)>();
+            foreach (var item in SplitTopLevel(columnList))
+            {
+                var trimmed = item.Trim();
+                if (trimmed.Length > 0)
+                {
+                    columns.Add(SplitAlias(trimmed));
+                }
+            }
+
+            return columns;
+        }
+
+
+        /// <summary>
+        /// Builds the single-row result SMO expects from its Server-properties probe. Values are
+        /// plausible constants for a modern on-premises instance; paths point at the TidalDb data root.
+        /// Only the column names and types must match what SMO's Server object reads.
+        /// </summary>
+        private static QueryResult BuildServerSettingsRow()
+        {
+            var machine = Environment.MachineName;
+            const string collation = "SQL_Latin1_General_CP1_CI_AS";
+            const string root = @"C:\ProgramData\TidalDb";
+            var dataPath = root + @"\data";
+            var logPath = root + @"\log";
+
+            return Row(
+                ("AuditLevel", 0),
+                ("NumberOfLogFiles", -1),
+                ("LoginMode", 2),
+                ("MailProfile", string.Empty),
+                ("BackupDirectory", root + @"\backup"),
+                ("PerfMonMode", 0),
+                ("InstallDataDirectory", dataPath),
+                ("ServiceName", "MSSQLSERVER"),
+                ("ErrorLogPath", logPath),
+                ("RootDirectory", root),
+                ("IsCaseSensitive", false),
+                ("MaxPrecision", (byte)38),
+                ("IsFullTextInstalled", false),
+                ("VersionString", ProductVersion),
+                ("Edition", "Developer Edition (64-bit)"),
+                ("ProductLevel", "RTM"),
+                ("ProductUpdateLevel", string.Empty),
+                ("IsSingleUser", false),
+                ("EngineEdition", EngineEdition),
+                ("Collation", collation),
+                ("IsClustered", false),
+                ("NetName", machine),
+                ("ComputerNamePhysicalNetBIOS", machine),
+                ("ServiceStartMode", 2),
+                ("MasterDBLogPath", logPath),
+                ("MasterDBPath", dataPath),
+                ("DefaultFile", dataPath),
+                ("DefaultLog", logPath),
+                ("ResourceVersionString", ProductVersion),
+                ("ResourceLastUpdateDateTime", new DateTime(2022, 1, 1)),
+                ("CollationID", 872468488),
+                ("ComparisonStyle", 196609),
+                ("SqlCharSet", (byte)1),
+                ("SqlCharSetName", "iso_1"),
+                ("SqlSortOrder", (byte)52),
+                ("SqlSortOrderName", "nocase_iso"),
+                ("BuildClrVersionString", "v4.0.30319"),
+                ("ServiceAccount", string.Empty),
+                ("NamedPipesEnabled", false),
+                ("TcpEnabled", true),
+                ("InstallSharedDirectory", dataPath),
+                ("SqlDomainGroup", string.Empty),
+                ("PolicyHealthState", 0),
+                ("FilestreamLevel", 0),
+                ("FilestreamShareName", string.Empty),
+                ("TapeLoadWaitTime", -1),
+                ("IsHadrEnabled", false),
+                ("HadrManagerStatus", TypedNull.Int),
+                ("ClusterName", string.Empty),
+                ("ClusterQuorumType", 4),
+                ("ClusterQuorumState", 3),
+                ("ServiceAccountSid", TypedNull.NVarChar),
+                ("IsPolyBaseInstalled", false),
+                ("Name", machine),
+                ("InstanceName", string.Empty),
+                ("Status", 1),
+                ("PathSeparator", @"\"),
+                ("IsContainedAuthentication", 0),
+                ("ServerType", TypedNull.Int));
+        }
+
         private static QueryResult Row(params (string Name, object? Value)[] columns)
         {
             var result = new QueryResult { Success = true, RowCount = 1 };

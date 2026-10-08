@@ -143,21 +143,37 @@ namespace TidalDbLib
         {
             try
             {
-                var databaseDirectory = Path.Combine(DatabasesRoot(), node.DatabaseName.Value);
+                var name = node.DatabaseName.Value;
+                var databaseDirectory = Path.Combine(DatabasesRoot(), name);
                 if (!Directory.Exists(databaseDirectory))
                 {
-                    throw new Exception($"Database {node.DatabaseName.Value} does not exist");
+                    // SSMS/SMO constantly issue "USE [master]" (and other system databases) to reset the
+                    // connection context. Those have no on-disk directory, so treat them as a successful
+                    // no-op instead of failing — a hard error here aborts Object Explorer enumeration.
+                    if (IsSystemDatabaseName(name))
+                    {
+                        this.LastResult.Message = $"Changed database context to '{name}'.";
+                        return;
+                    }
+
+                    throw new Exception($"Database {name} does not exist");
                 }
 
                 this.session.CurrentDatabasePath = databaseDirectory;
                 this.ApplyLoginContext();
-                this.LastResult.Message = $"Changed database context to '{node.DatabaseName.Value}'.";
+                this.LastResult.Message = $"Changed database context to '{name}'.";
             }
             catch (Exception ex)
             {
                 this.Fail(ex);
             }
         }
+
+        private static bool IsSystemDatabaseName(string name) =>
+            string.Equals(name, "master", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "tempdb", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "model", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "msdb", StringComparison.OrdinalIgnoreCase);
 
         public override void Visit(CreateTableStatement node)
         {
@@ -428,7 +444,7 @@ namespace TidalDbLib
                     .Select(row =>
                     {
                         var env = new Env(source.Schema, row, outer);
-                        return (Row: row, Keys: elems.Select(oe => this.GetScalarValue(oe.Expression, env)).ToArray());
+                        return (Row: row, Keys: elems.Select(oe => this.GetScalarValue(ResolveOrderKey(oe.Expression, querySpec, source.Schema), env)).ToArray());
                     })
                     .ToList();
 
@@ -455,6 +471,41 @@ namespace TidalDbLib
             }
 
             return this.ProjectRows(querySpec, source.Schema, filtered, outer);
+        }
+
+        private static ScalarExpression ResolveOrderKey(
+            ScalarExpression orderExpr, QuerySpecification querySpec, List<ColumnRef> sourceSchema)
+        {
+            // ORDER BY normally resolves against the source rows. SSMS/SMO (and standard SQL)
+            // allow ordering by a SELECT-list alias. If the order key is a single-part column
+            // reference that matches a SELECT alias but is NOT a real source column, substitute
+            // the aliased expression so it can be evaluated.
+            if (orderExpr is not ColumnReferenceExpression colRef ||
+                colRef.MultiPartIdentifier.Identifiers.Count != 1)
+            {
+                return orderExpr;
+            }
+
+            var name = colRef.MultiPartIdentifier.Identifiers[0].Value;
+
+            var isSourceColumn = sourceSchema.Any(c =>
+                string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (isSourceColumn)
+            {
+                return orderExpr;
+            }
+
+            foreach (var element in querySpec.SelectElements)
+            {
+                if (element is SelectScalarExpression scalar &&
+                    scalar.ColumnName?.Value is { } alias &&
+                    string.Equals(alias, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return scalar.Expression;
+                }
+            }
+
+            return orderExpr;
         }
 
         private RowSet ProjectRows(QuerySpecification querySpec, List<ColumnRef> sourceSchema, List<object?[]> filtered, Env? outer)
@@ -648,6 +699,29 @@ namespace TidalDbLib
                     if (IsSystemCatalog(named, "tables"))
                     {
                         return this.BuildTablesRowSet(qualifier);
+                    }
+
+                    if (IsSystemCatalog(named, "views") || IsSystemCatalog(named, "all_views"))
+                    {
+                        return this.BuildViewsRowSet(qualifier);
+                    }
+
+                    if (IsSystemCatalog(named, "columns") || IsSystemCatalog(named, "all_columns"))
+                    {
+                        return this.BuildColumnsRowSet(qualifier);
+                    }
+
+                    if (IsSystemCatalog(named, "types"))
+                    {
+                        return BuildTypesRowSet(qualifier);
+                    }
+
+                    {
+                        var empty = TryBuildEmptyCatalog(named, qualifier);
+                        if (empty != null)
+                        {
+                            return empty;
+                        }
                     }
 
                     if (IsSystemCatalog(named, "procedures"))
@@ -1055,9 +1129,118 @@ namespace TidalDbLib
             // A constrained (non-sysadmin) authenticated login only sees databases it can access.
             names = this.AccessibleDatabaseNames(names);
 
-            var schema = new List<ColumnRef> { new(qualifier, "name") };
-            var rows = names.Select(n => new object?[] { n }).ToList();
+            // Expose the sys.databases columns SMO/SSMS Object Explorer reads when it enumerates
+            // databases and loads their properties. Values are synthesized because the Parquet-backed
+            // engine has no real database-option metadata; every database is reported as an online,
+            // simple-recovery, read-write database. SMO wraps bit columns in CAST(... AS bit), so the
+            // integer flags here are surfaced to the client as proper bit values.
+            var rows = new List<object?[]>();
+            List<ColumnRef>? schema = null;
+            var id = 5; // 1-4 are reserved for master/tempdb/model/msdb in real SQL Server.
+            foreach (var n in names)
+            {
+                var cells = DescribeDatabaseRow(id++, n);
+                schema ??= cells.Select(c => new ColumnRef(qualifier, c.Name)).ToList();
+                rows.Add(cells.Select(c => c.Value).ToArray());
+            }
+
+            schema ??= DescribeDatabaseRow(5, "placeholder")
+                .Select(c => new ColumnRef(qualifier, c.Name)).ToList();
+
             return new RowSet(schema, rows);
+        }
+
+        /// <summary>
+        /// Describes one synthesized <c>sys.databases</c> row as an ordered (column, value) list. Kept
+        /// as a single source of truth so the column set and the per-row values cannot drift apart.
+        /// </summary>
+        private static List<(string Name, object? Value)> DescribeDatabaseRow(int databaseId, string name)
+        {
+            const string collation = "SQL_Latin1_General_CP1_CI_AS";
+            return new List<(string, object?)>
+            {
+                ("database_id", databaseId),
+                ("name", name),
+                ("source_database_id", null),
+                ("owner_sid", null),
+                ("create_date", new DateTime(2020, 1, 1)),
+                ("compatibility_level", 160),
+                ("collation_name", collation),
+                ("user_access", 0),
+                ("user_access_desc", "MULTI_USER"),
+                ("is_read_only", 0),
+                ("state", 0),
+                ("state_desc", "ONLINE"),
+                ("recovery_model", 3),
+                ("recovery_model_desc", "SIMPLE"),
+                ("is_auto_close_on", 0),
+                ("is_auto_shrink_on", 0),
+                ("is_in_standby", 0),
+                ("is_cleanly_shutdown", 1),
+                ("snapshot_isolation_state", 0),
+                ("snapshot_isolation_state_desc", "OFF"),
+                ("is_read_committed_snapshot_on", 0),
+                ("is_encrypted", 0),
+                ("containment", 0),
+                ("containment_desc", "NONE"),
+                ("catalog_collation_type", 0),
+                ("catalog_collation_type_desc", "DATABASE_DEFAULT"),
+                ("physical_database_name", name),
+                ("is_supplemental_logging_enabled", 0),
+                ("is_distributor", 0),
+                ("is_published", 0),
+                ("is_subscribed", 0),
+                ("is_merge_published", 0),
+                ("is_cdc_enabled", 0),
+                ("is_broker_enabled", 0),
+                ("log_reuse_wait", 0),
+                ("log_reuse_wait_desc", "NOTHING"),
+                ("is_trustworthy_on", 0),
+                ("is_db_chaining_on", 0),
+                ("is_parameterization_forced", 0),
+                ("is_master_key_encrypted_by_server", 0),
+                ("is_query_store_on", 0),
+                ("is_local_cursor_default", 0),
+                ("is_fulltext_enabled", 0),
+                ("is_numeric_roundabort_on", 0),
+                ("is_arithabort_on", 0),
+                ("is_ansi_padding_on", 0),
+                ("is_ansi_null_default_on", 0),
+                ("is_ansi_nulls_on", 0),
+                ("is_ansi_warnings_on", 0),
+                ("is_concat_null_yields_null_on", 0),
+                ("is_quoted_identifier_on", 0),
+                ("is_recursive_triggers_on", 0),
+                ("is_cursor_close_on_commit_on", 0),
+                ("is_auto_update_stats_on", 1),
+                ("is_auto_create_stats_on", 1),
+                ("is_auto_create_stats_incremental_on", 0),
+                ("is_auto_update_stats_async_on", 0),
+                ("is_date_correlation_on", 0),
+                ("page_verify_option", 2),
+                ("page_verify_option_desc", "CHECKSUM"),
+                ("target_recovery_time_in_seconds", 60),
+                ("delayed_durability", 0),
+                ("delayed_durability_desc", "DISABLED"),
+                ("group_database_id", null),
+                ("replica_id", null),
+                ("default_language_lcid", 1033),
+                ("default_language_name", "us_english"),
+                ("default_fulltext_language_lcid", 1033),
+                ("default_fulltext_language_name", "English"),
+                ("is_nested_triggers_on", 1),
+                ("is_transform_noise_words_on", 0),
+                ("two_digit_year_cutoff", 2049),
+                ("is_memory_optimized_elevate_to_snapshot_on", 0),
+                ("is_temporal_history_retention_enabled", 1),
+                ("is_mixed_page_allocation_on", 0),
+                ("is_result_set_caching_on", 0),
+                ("is_accelerated_database_recovery_on", 0),
+                ("is_tempdb_spill_to_remote_store", 0),
+                ("is_stale_page_detection_on", 0),
+                ("is_memory_optimized_enabled", 1),
+                ("is_ledger_on", 0),
+            };
         }
 
         private RowSet BuildObjectsRowSet(string qualifier)
@@ -1083,14 +1266,279 @@ namespace TidalDbLib
             var tables = new List<(string Name, string Type)>();
             CollectTables(dbPath, tables);
 
-            var schema = new List<ColumnRef> { new(qualifier, "name") };
-            var rows = tables
+            var names = tables
                 .Where(t => this.CanSeeTable(t.Name))
-                .OrderBy(t => t.Name, StringComparer.OrdinalIgnoreCase)
-                .Select(t => new object?[] { t.Name })
+                .Select(t => t.Name)
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+            return BuildObjectCatalogRowSet(qualifier, names, "U ", "USER_TABLE");
+        }
+
+        private RowSet BuildViewsRowSet(string qualifier)
+        {
+            var dbPath = this.RequireDatabasePath();
+            var views = new List<(string Name, string Type)>();
+            CollectObjects(dbPath, "views", "*.*", "view", views);
+
+            var names = views
+                .Select(v => v.Name)
+                .Where(n => this.CanViewObjectByName(n))
+                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            return BuildObjectCatalogRowSet(qualifier, names, "V ", "VIEW");
+        }
+
+        /// <summary>
+        /// Builds a sys.tables/sys.views-shaped rowset. SMO Object Explorer reads schema_id,
+        /// object_id, type, type_desc, create/modify dates and the is_* flags; omitting them
+        /// makes enumeration fail with "Column [...] does not exist".
+        /// </summary>
+        private static RowSet BuildObjectCatalogRowSet(
+            string qualifier, List<string> names, string type, string typeDesc)
+        {
+            var columns = new (string Name, Func<int, string, object?> Value)[]
+            {
+                ("name", (id, n) => n),
+                ("object_id", (id, n) => id),
+                ("principal_id", (id, n) => null),
+                ("schema_id", (id, n) => 1),
+                ("parent_object_id", (id, n) => 0),
+                ("type", (id, n) => type),
+                ("type_desc", (id, n) => typeDesc),
+                ("create_date", (id, n) => CatalogEpoch),
+                ("modify_date", (id, n) => CatalogEpoch),
+                ("is_ms_shipped", (id, n) => false),
+                ("is_published", (id, n) => false),
+                ("is_schema_published", (id, n) => false),
+            };
+
+            var schema = columns.Select(c => new ColumnRef(qualifier, c.Name)).ToList();
+            var rows = new List<object?[]>();
+            foreach (var n in names)
+            {
+                var id = ObjectId(n);
+                rows.Add(columns.Select(c => c.Value(id, n)).ToArray());
+            }
+
             return new RowSet(schema, rows);
         }
+
+        private static readonly DateTime CatalogEpoch = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Unspecified);
+
+        /// <summary>
+        /// Deterministic positive object id for a named object, stable across sys.tables /
+        /// sys.all_columns so SMO's object_id joins line up. Collisions are astronomically
+        /// unlikely for the small object counts involved.
+        /// </summary>
+        private static int ObjectId(string name)
+        {
+            unchecked
+            {
+                var hash = 2166136261u;
+                foreach (var ch in name.ToUpperInvariant())
+                {
+                    hash = (hash ^ ch) * 16777619u;
+                }
+
+                // Keep it comfortably positive and away from the low ids reserved above.
+                return (int)(hash & 0x7FFFFFFF) | 0x100;
+            }
+        }
+
+        /// <summary>
+        /// sys.columns / sys.all_columns across every visible table. SMO reads these (joined to
+        /// sys.tables on object_id) to populate a table's Columns collection.
+        /// </summary>
+        private RowSet BuildColumnsRowSet(string qualifier)
+        {
+            var dbPath = this.RequireDatabasePath();
+            var tables = new List<(string Name, string Type)>();
+            CollectTables(dbPath, tables);
+
+            var columnDefs = new (string Name, Func<ColumnFacts, object?> Value)[]
+            {
+                ("object_id", c => c.ObjectId),
+                ("name", c => c.Name),
+                ("column_id", c => c.ColumnId),
+                ("system_type_id", c => c.SystemTypeId),
+                ("user_type_id", c => c.SystemTypeId),
+                ("max_length", c => c.MaxLength),
+                ("precision", c => c.Precision),
+                ("scale", c => c.Scale),
+                ("collation_name", c => c.IsString ? "SQL_Latin1_General_CP1_CI_AS" : null),
+                ("is_nullable", c => c.IsNullable),
+                ("is_ansi_padded", c => false),
+                ("is_rowguidcol", c => false),
+                ("is_identity", c => false),
+                ("is_computed", c => false),
+                ("is_filestream", c => false),
+                ("is_replicated", c => false),
+                ("is_sparse", c => false),
+                ("is_column_set", c => false),
+                ("default_object_id", c => 0),
+                ("rule_object_id", c => 0),
+                ("xml_collection_id", c => 0),
+            };
+
+            var schema = columnDefs
+                .Select(c => new ColumnRef(qualifier, c.Name))
+                .ToList();
+
+            var rows = new List<object?[]>();
+            foreach (var (tableName, _) in tables)
+            {
+                if (!this.CanSeeTable(tableName))
+                {
+                    continue;
+                }
+
+                var facts = this.CollectColumnFacts(tableName);
+                foreach (var f in facts)
+                {
+                    rows.Add(columnDefs
+                        .Select(c => c.Value(f))
+                        .ToArray());
+                }
+            }
+
+            return new RowSet(schema, rows);
+        }
+
+        private sealed record ColumnFacts(
+            int ObjectId, string Name, int ColumnId, int SystemTypeId,
+            int MaxLength, int Precision, int Scale, bool IsNullable, bool IsString);
+
+        private List<ColumnFacts> CollectColumnFacts(string tableName)
+        {
+            var result = new List<ColumnFacts>();
+            try
+            {
+                var source = this.ResolveTableSource(Security.SecurityCatalog.DboSchema, tableName);
+                if (!source.Exists)
+                {
+                    return result;
+                }
+
+                var meta = LoadTableMeta(source.PrimaryFile);
+                var cols = meta?.Columns ?? ReadSchemaColumns(source.PrimaryFile);
+                var objectId = ObjectId(tableName);
+                var columnId = 1;
+                foreach (var col in cols)
+                {
+                    var (sysType, maxLen, precision, scale, isString) = MapCatalogType(col.Type);
+                    result.Add(new ColumnFacts(
+                        objectId, col.Name, columnId++, sysType, maxLen, precision, scale, col.Nullable, isString));
+                }
+            }
+            catch
+            {
+                // A table we cannot read contributes no columns rather than failing the whole view.
+            }
+
+            return result;
+        }
+
+        /// <summary>Maps the engine's physical type bucket to (system_type_id, max_length, precision, scale, isString).</summary>
+        private static (int SystemTypeId, int MaxLength, int Precision, int Scale, bool IsString) MapCatalogType(string type)
+        {
+            switch (type)
+            {
+                case "int":
+                    return (56, 4, 10, 0, false);
+                case "decimal":
+                    return (106, 9, 18, 2, false);
+                case "datetime":
+                    return (61, 8, 23, 3, false);
+                default:
+                    // nvarchar(MAX): max_length -1 signals MAX to SMO.
+                    return (231, -1, 0, 0, true);
+            }
+        }
+
+        /// <summary>
+        /// sys.types — the minimal set the engine can produce, so SMO can resolve a column's
+        /// DataType by system_type_id/user_type_id.
+        /// </summary>
+        private static RowSet BuildTypesRowSet(string qualifier)
+        {
+            var defs = new (int Id, string Name, int MaxLength, int Precision, int Scale)[]
+            {
+                (56, "int", 4, 10, 0),
+                (106, "decimal", 9, 18, 2),
+                (61, "datetime", 8, 23, 3),
+                (231, "nvarchar", -1, 0, 0),
+                (104, "bit", 1, 1, 0),
+                (127, "bigint", 8, 19, 0),
+            };
+
+            var columns = new (string Name, Func<(int Id, string Name, int MaxLength, int Precision, int Scale), object?> Value)[]
+            {
+                ("name", t => t.Name),
+                ("system_type_id", t => t.Id),
+                ("user_type_id", t => t.Id),
+                ("schema_id", t => 4),
+                ("principal_id", t => null),
+                ("max_length", t => t.MaxLength),
+                ("precision", t => t.Precision),
+                ("scale", t => t.Scale),
+                ("collation_name", t => t.Name == "nvarchar" ? "SQL_Latin1_General_CP1_CI_AS" : null),
+                ("is_nullable", t => true),
+                ("is_user_defined", t => false),
+                ("is_assembly_type", t => false),
+                ("default_object_id", t => 0),
+                ("rule_object_id", t => 0),
+                ("is_table_type", t => false),
+            };
+
+            var schema = columns.Select(c => new ColumnRef(qualifier, c.Name)).ToList();
+            var rows = defs.Select(t => columns.Select(c => c.Value(t)).ToArray()).ToList();
+            return new RowSet(schema, rows);
+        }
+
+        /// <summary>
+        /// Returns an empty rowset (with a plausible column surface) for catalog views SMO probes
+        /// but that the engine has no real data for (indexes, constraints, triggers, …). Returning
+        /// an empty, correctly-shaped result lets Object Explorer finish expanding a node instead of
+        /// failing on "Table [...] does not exist".
+        /// </summary>
+        private static RowSet? TryBuildEmptyCatalog(NamedTableReference named, string qualifier)
+        {
+            string[] names =
+            {
+                "indexes", "index_columns", "foreign_keys", "foreign_key_columns",
+                "key_constraints", "check_constraints", "default_constraints",
+                "triggers", "assembly_modules", "sql_modules", "computed_columns",
+                "stats", "stats_columns", "identity_columns", "extended_properties",
+                "sequences", "partitions", "allocation_units",
+            };
+
+            foreach (var name in names)
+            {
+                if (IsSystemCatalog(named, name))
+                {
+                    var schema = new List<ColumnRef>
+                    {
+                        new(qualifier, "object_id"),
+                        new(qualifier, "name"),
+                        new(qualifier, "schema_id"),
+                        new(qualifier, "parent_object_id"),
+                        new(qualifier, "type"),
+                        new(qualifier, "type_desc"),
+                        new(qualifier, "column_id"),
+                        new(qualifier, "index_id"),
+                        new(qualifier, "is_ms_shipped"),
+                        new(qualifier, "definition"),
+                    };
+                    return new RowSet(schema, new List<object?[]>());
+                }
+            }
+
+            return null;
+        }
+
+
 
         /// <summary>
         /// Metadata visibility: a constrained user only sees objects they have been granted visibility
@@ -1397,10 +1845,21 @@ namespace TidalDbLib
             _ => throw new NotSupportedException($"Unsupported comparison operator: {op}")
         };
 
-        private static bool IsNumeric(object value) => value is int || value is decimal;
+        private static bool IsNumeric(object value) => value is int || value is decimal || value is bool;
 
         private static int CompareTyped(object a, object b)
         {
+            // Treat bit (bool) as numeric 0/1 so predicates like CAST(x AS bit) = 0 compare correctly.
+            if (a is bool ab)
+            {
+                a = ab ? 1 : 0;
+            }
+
+            if (b is bool bb)
+            {
+                b = bb ? 1 : 0;
+            }
+
             if (a is int ai && b is int bi)
             {
                 return ai.CompareTo(bi);

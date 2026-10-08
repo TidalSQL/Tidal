@@ -11,6 +11,8 @@ namespace TidalDbServer.Tds
     internal enum ColumnKind
     {
         Int,
+        TinyInt,
+        SmallInt,
         BigInt,
         Bit,
         Float,
@@ -90,6 +92,14 @@ namespace TidalDbServer.Tds
                         w.WriteByte(TdsDataType.IntN);
                         w.WriteByte(4);
                         break;
+                    case ColumnKind.TinyInt:
+                        w.WriteByte(TdsDataType.IntN);
+                        w.WriteByte(1);
+                        break;
+                    case ColumnKind.SmallInt:
+                        w.WriteByte(TdsDataType.IntN);
+                        w.WriteByte(2);
+                        break;
                     case ColumnKind.BigInt:
                         w.WriteByte(TdsDataType.IntN);
                         w.WriteByte(8);
@@ -152,6 +162,20 @@ namespace TidalDbServer.Tds
                     if (isNull) { w.WriteByte(0); break; }
                     w.WriteByte(4);
                     w.WriteInt32LE(Convert.ToInt32(value, CultureInfo.InvariantCulture));
+                    break;
+
+                case ColumnKind.TinyInt:
+                    if (isNull) { w.WriteByte(0); break; }
+                    w.WriteByte(1);
+                    w.WriteByte(Convert.ToByte(value, CultureInfo.InvariantCulture));
+                    break;
+
+                case ColumnKind.SmallInt:
+                    if (isNull) { w.WriteByte(0); break; }
+                    w.WriteByte(2);
+                    Span<byte> s16 = stackalloc byte[2];
+                    BinaryPrimitives.WriteInt16LittleEndian(s16, Convert.ToInt16(value, CultureInfo.InvariantCulture));
+                    w.WriteBytes(s16);
                     break;
 
                 case ColumnKind.BigInt:
@@ -235,7 +259,9 @@ namespace TidalDbServer.Tds
             var kind = sample switch
             {
                 bool => ColumnKind.Bit,
-                byte or sbyte or short or ushort or int or uint => ColumnKind.Int,
+                byte => ColumnKind.TinyInt,
+                sbyte or short or ushort => ColumnKind.SmallInt,
+                int or uint => ColumnKind.Int,
                 long or ulong => ColumnKind.BigInt,
                 float or double => ColumnKind.Float,
                 decimal => ColumnKind.Decimal,

@@ -42,6 +42,24 @@ namespace TidalDbServer.Tds
             w.WriteBytes(body);
         }
 
+        /// <summary>ENVCHANGE for the SQL collation (type 7). Required so clients can encode the
+        /// character parameters of RPC requests; without it Microsoft.Data.SqlClient throws a
+        /// NullReferenceException in TdsExecuteRPC because its default collation is never set.</summary>
+        public static void WriteCollationEnvChange(TdsResponseWriter w, byte[] collation)
+        {
+            var body = Build(bw =>
+            {
+                bw.Write(TdsEnvChangeType.SqlCollation);
+                bw.Write((byte)collation.Length); // new value: B_VARBYTE
+                bw.Write(collation);
+                bw.Write((byte)0);                // old value: empty
+            });
+
+            w.WriteByte(TdsToken.EnvChange);
+            w.WriteUInt16LE((ushort)body.Length);
+            w.WriteBytes(body);
+        }
+
         /// <summary>ENVCHANGE for the negotiated packet size (type 4).</summary>
         public static void WritePacketSizeEnvChange(TdsResponseWriter w, int packetSize)
         {

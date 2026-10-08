@@ -184,6 +184,73 @@ namespace TidalDbLib
         }
 
         /// <summary>
+        /// One database as surfaced to SSMS Object Explorer's Databases folder: its display name, a
+        /// synthesized stable id and a creation date derived from the database directory.
+        /// </summary>
+        public readonly record struct ExplorerDatabase(string Name, int Id, DateTime CreateDate);
+
+        /// <summary>
+        /// Enumerates the user databases for SSMS Object Explorer's Databases folder, honoring the same
+        /// visibility rules as <c>sys.databases</c>: a sysadmin (or unauthenticated full-control session)
+        /// sees every database; a constrained login sees only those it can access. Ids start at 5, since
+        /// 1-4 are reserved for the system databases (master/tempdb/model/msdb) in SQL Server.
+        /// </summary>
+        public IReadOnlyList<ExplorerDatabase> ListExplorerDatabases()
+        {
+            lock (this.gate)
+            {
+                var all = Directory.Exists(DatabasesRoot)
+                    ? Directory.GetDirectories(DatabasesRoot)
+                        .Select(Path.GetFileName)
+                        .Where(n => !string.IsNullOrEmpty(n))
+                        .Select(n => n!)
+                        .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                        .ToList()
+                    : new List<string>();
+
+                var login = this.session.CurrentLogin;
+                var visible = (login == null || this.session.IsSysadminLogin)
+                    ? all
+                    : all.Where(this.LoginCanAccessDatabase).ToList();
+
+                var result = new List<ExplorerDatabase>(visible.Count);
+                var id = 5;
+                foreach (var name in visible)
+                {
+                    DateTime created;
+                    try
+                    {
+                        created = Directory.GetCreationTime(Path.Combine(DatabasesRoot, name));
+                    }
+                    catch
+                    {
+                        created = new DateTime(2020, 1, 1);
+                    }
+
+                    result.Add(new ExplorerDatabase(name, id++, created));
+                }
+
+                return result;
+            }
+        }
+
+        private bool LoginCanAccessDatabase(string database)
+        {
+            var login = this.session.CurrentLogin;
+            if (login == null)
+            {
+                return false;
+            }
+
+            var dbPath = Path.Combine(DatabasesRoot, database);
+            var catalog = new SecurityCatalog(SystemRoot, dbPath);
+            var user = catalog.GetPrincipals().FirstOrDefault(p =>
+                p.Kind == PrincipalKind.User &&
+                string.Equals(p.LoginName, login, StringComparison.OrdinalIgnoreCase));
+            return user != null && new Authorizer(catalog).HasAnyAccess(user.Name);
+        }
+
+        /// <summary>
         /// True when the current login may view server-scoped security (logins and server roles) in the
         /// explorer — i.e. it is a member of the fixed <c>sysadmin</c> or <c>securityadmin</c> server
         /// roles. Server security is administrator-only; everyone else sees an empty Security node.

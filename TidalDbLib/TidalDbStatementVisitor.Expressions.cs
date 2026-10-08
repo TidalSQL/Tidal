@@ -215,6 +215,33 @@ namespace TidalDbLib
                     // These normally arrive as CastCall/ConvertCall nodes, but guard anyway.
                     throw new NotSupportedException("Use CAST(... AS type) / CONVERT(type, ...).");
 
+                case "SCHEMA_NAME":
+                    // The engine models a single 'dbo' schema; any schema_id maps to it.
+                    return "dbo";
+
+                case "SCHEMA_ID":
+                    return 1;
+
+                case "USER_NAME":
+                case "CURRENT_USER":
+                    return "dbo";
+
+                case "DB_NAME":
+                {
+                    var current = this.session.CurrentDatabasePath;
+                    return current == null ? null : Path.GetFileName(current);
+                }
+
+                case "OBJECT_NAME":
+                    return args.Count > 0 ? Stringify(Arg(0)) : null;
+
+                case "OBJECT_SCHEMA_NAME":
+                    return "dbo";
+
+                case "OBJECT_ID":
+                    // We cannot resolve a real object id; null is a valid "not found" answer.
+                    return null;
+
                 default:
                     throw new NotSupportedException($"Unsupported function: {name}.");
             }
@@ -256,6 +283,15 @@ namespace TidalDbLib
             }
 
             var sqlType = dataType.Name?.BaseIdentifier?.Value ?? "NVARCHAR";
+
+            // BIT casts evaluate to a CLR bool so that result writers surface a real bit column and
+            // callers (e.g. SMO's GetBoolean) read it correctly. Table column storage still maps BIT
+            // through MapSqlType ("int") — this only affects explicit CAST/CONVERT expressions.
+            if (string.Equals(sqlType, "BIT", StringComparison.OrdinalIgnoreCase))
+            {
+                return ToBit(value);
+            }
+
             var physical = MapSqlType(sqlType);
             switch (physical)
             {
@@ -342,6 +378,14 @@ namespace TidalDbLib
             double db => (int)db,
             string s => int.Parse(s, CultureInfo.InvariantCulture),
             _ => Convert.ToInt32(value, CultureInfo.InvariantCulture),
+        };
+
+        private static bool ToBit(object? value) => value switch
+        {
+            null => false,
+            bool b => b,
+            string s => !(s == "0" || string.Equals(s, "false", StringComparison.OrdinalIgnoreCase) || s.Length == 0),
+            _ => Convert.ToDecimal(value, CultureInfo.InvariantCulture) != 0m,
         };
 
         private static decimal ToDecimal(object? value) => value switch
